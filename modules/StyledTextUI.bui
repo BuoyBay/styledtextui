@@ -1,0 +1,1857 @@
+Import styledtext
+
+Private Class RichOwner
+    Public Property Editor As Weak StyledTextEditor
+    Public Property State As RichState
+End Class
+Private Class RichRegistry
+    Public Shared Property Items As Array Of RichOwner = []
+End Class
+Private Class RichState
+    Public Property ErrorSink As Weak StyledTextEditor
+    Public Property CallbackDepth As Integer = 0
+    Public Property MessageDepth As Integer = 0
+    Public Property DrainingMessages As Boolean = False
+    Public Property TextPending As Boolean = False
+    Public Property SelectionPending As Boolean = False
+    Public Property PendingHigh As Integer = 0
+    Public Property Host As Ptr = Nil
+    Public Property Root As Ptr = Nil
+    Public Property Entry As Ptr = Nil
+    Public Property Buffer As Ptr = Nil
+    Public Property ID As Integer = -1
+    Public Property Signals As Array Of UInt64 = []
+    Public Property Tags As Array Of Ptr = []
+    Public Property KeyController As Ptr = Nil
+End Class
+Private Class RichSelection
+    Public Property Start As Integer = 0
+    Public Property Length As Integer = 0
+End Class
+Private Class RichSnapshot
+    Public Property Data As Bytes
+    Public Property Start As Integer = 0
+    Public Property Length As Integer = 0
+    Public Property Typing As TextStyle
+End Class
+
+Private Function RichClone(document As StyledText) As StyledText
+    If document Is Nil Then Throw New InvalidArgumentException("Document must not be Nil")
+    Return StyledText.FromRuns(document.PlainText(), document.Runs(), document.DefaultStyle())
+End Function
+Private Sub RichValidateStyle(style As TextStyle)
+    Dim checked As TextStyle = style.Copy()
+    If checked.FontSize <> 0.0 And Not (checked.FontSize >= 1.0 And checked.FontSize <= 512.0) Then Throw New InvalidArgumentException("Editor font size must be zero or 1..512 points")
+    If checked.FontName.AsUTF16LE().Count > 62 Then Throw New InvalidArgumentException("Editor font family must fit 31 UTF-16 units")
+End Sub
+Private Sub RichValidate(document As StyledText)
+    If document.Length() > 100000 Then Throw New InvalidArgumentException("Editor content exceeds 100000 scalars")
+    If String.Contains(document.PlainText(), "\r") Then Throw New InvalidArgumentException("Editor content requires LF newlines")
+    RichValidateStyle(document.DefaultStyle())
+    Dim runs As Array Of StyleRun = document.Runs()
+    If Array.Count(runs) > 4096 Then Throw New InvalidArgumentException("Editor exceeds 4096 style runs")
+    For Each run As StyleRun In runs
+        RichValidateStyle(run.Style)
+    Next
+End Sub
+Private Function RichOffsets(content As String) As Array Of Integer
+    Dim offsets() As Integer
+    Dim position As Integer = 0
+    Array.Append(offsets, 0)
+    For Each ch As String In String.Chars(content)
+        position += 1
+        If String.Asc(ch) > 65535 Then position += 1
+        Array.Append(offsets, position)
+    Next
+    Return offsets
+End Function
+Private Function RichScalarAt(offsets As Array Of Integer, position As Integer) As Integer
+    ' Native controls occasionally return a surrogate-interior caret. Reject it.
+    Dim lo As Integer = 0
+    Dim hi As Integer = Array.Count(offsets) - 1
+    While lo <= hi
+        Dim mid As Integer = (lo + hi) \ 2
+        If offsets(mid) = position Then Return mid
+        If offsets(mid) < position Then
+            lo = mid + 1
+        Else
+            hi = mid - 1
+        End If
+    End While
+    Throw New InvalidArgumentException("Native selection splits a Unicode scalar")
+End Function
+Private Sub RichCheckRange(document As StyledText, start As Integer, length As Integer)
+    If start < 0 Or start > document.Length() Then Throw New InvalidArgumentException("Selection start out of bounds")
+    If length < 0 Or length > document.Length() - start Then Throw New InvalidArgumentException("Selection length out of bounds")
+End Sub
+Private Function RichCaretStyle(document As StyledText, start As Integer, length As Integer) As TextStyle
+    If document.Length() = 0 Then Return document.DefaultStyle()
+    If length > 0 Or start = 0 Then Return document.StyleAt(start)
+    Return document.StyleAt(start - 1)
+End Function
+Private Sub RichAppendRun(runs As Array Of StyleRun, start As Integer, length As Integer, style As TextStyle)
+    If length = 0 Then Return
+    Dim run As New StyleRun()
+    run.Start = start
+    run.Length = length
+    run.Style = style
+    Array.Append(runs, run)
+End Sub
+
+@MainThreadDestruction
+''' Native rich-text editing. All operations belong to the UI thread; Open after attaching.
+Public Class StyledTextEditor Inherits View
+    Event DocumentChanged()
+    Event SelectionChanged()
+    Private Property mDocument As StyledText = New StyledText()
+    Private Property mTyping As TextStyle = New TextStyle()
+    Private Property mState As RichState
+    Private Property mUpdating As Boolean = False
+    Private Property mStart As Integer = 0
+    Private Property mLength As Integer = 0
+    Private Property mReadOnly As Boolean = False
+    Private Property mEditStart As Integer = -1
+    Private Property mEditLength As Integer = 0
+    Private Property mGroupDepth As Integer = 0
+    Private Property mGroupBefore As RichSnapshot
+    Private Property mGroupChanged As Boolean = False
+    Private Property mGroupMerge As Boolean = False
+    Private Property mNativeKind As Integer = 0
+    Private Property mNativeCaret As Integer = -1
+    Private Property mNativeBefore As RichSnapshot
+    Private Property mNativeStyle As TextStyle
+    Private Property mUndo As Array Of RichSnapshot = []
+    Private Property mRedo As Array Of RichSnapshot = []
+    Public Property LastNativeError As String = ""
+
+    Public Property Text As String
+        Get
+            Return mDocument.PlainText()
+        End Get
+        Set
+            SetDocument(New StyledText(value, mDocument.DefaultStyle()))
+        End Set
+    End Property
+    Public Property CharacterCount As Integer
+        Get
+            Return mDocument.Length()
+        End Get
+    End Property
+    Public Property IsOpen As Boolean
+        Get
+            Return mState <> Nil And mState.Entry <> Nil
+        End Get
+    End Property
+    Public Property TextHandle As Ptr
+        Get
+            If mState Is Nil Then Return Nil
+            Return mState.Entry
+        End Get
+    End Property
+    Public Property BufferHandle As Ptr
+        Get
+            If mState Is Nil Then Return Nil
+            Return mState.Buffer
+        End Get
+    End Property
+    Public Property IsReadOnly As Boolean
+        Get
+            Return mReadOnly
+        End Get
+        Set
+            mReadOnly = value
+            If IsOpen Then RichNativeEditable(mState, Not value)
+        End Set
+    End Property
+    Public Property SelectionStart As Integer
+        Get
+            Return mStart
+        End Get
+    End Property
+    Public Property SelectionLength As Integer
+        Get
+            Return mLength
+        End Get
+    End Property
+    Public Property CanUndo As Boolean
+        Get
+            Return Array.Count(mUndo) > 0
+        End Get
+    End Property
+    Public Property CanRedo As Boolean
+        Get
+            Return Array.Count(mRedo) > 0
+        End Get
+    End Property
+    Public Function Document() As StyledText
+        Return RichClone(mDocument)
+    End Function
+    Public Function TypingStyle() As TextStyle
+        Return mTyping.Copy()
+    End Function
+    Public Function SelectedText() As String
+        Return String.Substring(mDocument.PlainText(), mStart, mLength)
+    End Function
+    Public Sub SetDocument(document As StyledText)
+        Dim copied As StyledText = RichClone(document)
+        RichValidate(copied)
+        Commit(copied, 0, 0, RichCaretStyle(copied, 0, 0), True)
+        ClearHistory()
+        RaiseEvent DocumentChanged()
+    End Sub
+    Public Sub Select(start As Integer, length As Integer)
+        mNativeKind = 0
+        RichCheckRange(mDocument, start, length)
+        Dim typing As TextStyle = RichCaretStyle(mDocument, start, length)
+        Commit(mDocument, start, length, typing, False)
+        RaiseEvent SelectionChanged()
+    End Sub
+    Public Sub SetTypingStyle(style As TextStyle)
+        mNativeKind = 0
+        If style Is Nil Then Throw New InvalidArgumentException("Typing style must not be Nil")
+        Dim copied As TextStyle = style.Copy()
+        RichValidateStyle(copied)
+        Commit(mDocument, mStart, mLength, copied, False)
+    End Sub
+    Public Sub ApplySelectionStyle(style As TextStyle)
+        mNativeKind = 0
+        If mReadOnly Then Return
+        If style Is Nil Then Throw New InvalidArgumentException("Style must not be Nil")
+        Dim copied As TextStyle = style.Copy()
+        RichValidateStyle(copied)
+        Dim nextDocument As StyledText = RichClone(mDocument)
+        nextDocument.SetStyle(mStart, mLength, copied)
+        RichValidate(nextDocument)
+        Dim before As RichSnapshot = Snapshot()
+        Commit(nextDocument, mStart, mLength, copied, False)
+        Remember(before)
+        RaiseEvent DocumentChanged()
+    End Sub
+    Public Sub SetSelectionBold(value As Boolean)
+        SetSelectionFlag(1, value)
+    End Sub
+    Public Sub SetSelectionItalic(value As Boolean)
+        SetSelectionFlag(2, value)
+    End Sub
+    Public Sub SetSelectionUnderline(value As Boolean)
+        SetSelectionFlag(3, value)
+    End Sub
+    Private Sub SetSelectionFlag(kind As Integer, value As Boolean)
+        mNativeKind = 0
+        If mReadOnly Then Return
+        Dim typing As TextStyle = mTyping.Copy()
+        RichFlag(typing, kind, value)
+        Dim runs() As StyleRun
+        For Each run As StyleRun In mDocument.Runs()
+            Dim low As Integer = Math.Max(run.Start, mStart)
+            Dim high As Integer = Math.Min(run.Start + run.Length, mStart + mLength)
+            If low >= high Then
+                Array.Append(runs, run)
+            Else
+                RichAppendRun(runs, run.Start, low - run.Start, run.Style)
+                Dim style As TextStyle = run.Style.Copy()
+                RichFlag(style, kind, value)
+                RichAppendRun(runs, low, high - low, style)
+                RichAppendRun(runs, high, run.Start + run.Length - high, run.Style)
+            End If
+        Next
+        Dim nextDocument As StyledText = StyledText.FromRuns(mDocument.PlainText(), runs, mDocument.DefaultStyle())
+        RichValidate(nextDocument)
+        Dim before As RichSnapshot = Snapshot()
+        Commit(nextDocument, mStart, mLength, typing, False)
+        Remember(before)
+        RaiseEvent DocumentChanged()
+    End Sub
+    ''' Replace selected text with explicit typing attributes, preserving outside styles.
+    Public Sub ReplaceSelection(content As String)
+        mNativeKind = 0
+        If mReadOnly Then Return
+        If content = "" And mLength = 0 Then Return
+        Dim insertion As New StyledText(content, mTyping)
+        Dim nextDocument As StyledText = RichClone(mDocument)
+        nextDocument.Delete(mStart, mLength)
+        nextDocument.Insert(mStart, content, mTyping)
+        RichValidate(nextDocument)
+        Dim before As RichSnapshot = Snapshot()
+        Dim caret As Integer = mStart + insertion.Length()
+        Commit(nextDocument, caret, 0, mTyping, True)
+        Remember(before)
+        RaiseEvent DocumentChanged()
+        RaiseEvent SelectionChanged()
+    End Sub
+    Private Sub CancelNativeGroup()
+        mNativeKind = 0
+        mNativeBefore = Nil
+        mGroupBefore = Nil
+        mGroupChanged = False
+        mGroupMerge = False
+    End Sub
+    Public Sub ClearHistory()
+        CancelNativeGroup()
+        Array.Clear(mUndo)
+        Array.Clear(mRedo)
+    End Sub
+    Public Sub Undo()
+        FlushNativeGroup()
+        mNativeKind = 0
+        If mReadOnly Or Not CanUndo Then Return
+        Dim target As RichSnapshot = mUndo(Array.Count(mUndo) - 1)
+        Dim current As RichSnapshot = Snapshot()
+        Commit(DecodeStyledText(target.Data), target.Start, target.Length, target.Typing, True)
+        Array.RemoveAt(mUndo, Array.Count(mUndo) - 1)
+        Array.Append(mRedo, current)
+        TrimHistory()
+        RaiseEvent DocumentChanged()
+        RaiseEvent SelectionChanged()
+    End Sub
+    Public Sub Redo()
+        FlushNativeGroup()
+        mNativeKind = 0
+        If mReadOnly Or Not CanRedo Then Return
+        Dim target As RichSnapshot = mRedo(Array.Count(mRedo) - 1)
+        Dim current As RichSnapshot = Snapshot()
+        Commit(DecodeStyledText(target.Data), target.Start, target.Length, target.Typing, True)
+        Array.RemoveAt(mRedo, Array.Count(mRedo) - 1)
+        Array.Append(mUndo, current)
+        TrimHistory()
+        RaiseEvent DocumentChanged()
+        RaiseEvent SelectionChanged()
+    End Sub
+    Private Function Snapshot() As RichSnapshot
+        Dim saved As New RichSnapshot()
+        saved.Data = EncodeStyledText(mDocument)
+        saved.Start = mStart
+        saved.Length = mLength
+        saved.Typing = mTyping.Copy()
+        Return saved
+    End Function
+    Private Sub Remember(saved As RichSnapshot)
+        If mGroupDepth > 0 Then
+            If mGroupBefore Is Nil Then mGroupBefore = saved
+            mGroupChanged = True
+            Return
+        End If
+        Array.Append(mUndo, saved)
+        Array.Clear(mRedo)
+        TrimHistory()
+    End Sub
+    Private Sub TrimHistory()
+        Dim bytes As Integer = 0
+        For Each item As RichSnapshot In mUndo
+            bytes += item.Data.Count
+        Next
+        For Each item As RichSnapshot In mRedo
+            bytes += item.Data.Count
+        Next
+        While bytes > 8000000 Or Array.Count(mUndo) + Array.Count(mRedo) > 100
+            If Array.Count(mUndo) > 0 Then
+                bytes -= mUndo(0).Data.Count
+                Array.RemoveAt(mUndo, 0)
+            Else
+                bytes -= mRedo(0).Data.Count
+                Array.RemoveAt(mRedo, 0)
+            End If
+        End While
+    End Sub
+    Private Sub Commit(document As StyledText, start As Integer, length As Integer, typing As TextStyle, writeContent As Boolean)
+        mUpdating = True
+        Try
+            If IsOpen Then
+                If writeContent Then RichNativeWrite(mState, document.PlainText())
+                RichNativeRender(mState, document)
+                RichNativeSelect(mState, document.PlainText(), start, length)
+                RichNativeTyping(mState, typing)
+            End If
+        Catch e As Exception
+            Try
+                If IsOpen Then
+                    RichNativeWrite(mState, mDocument.PlainText())
+                    RichNativeRender(mState, mDocument)
+                    RichNativeSelect(mState, mDocument.PlainText(), mStart, mLength)
+                    RichNativeTyping(mState, mTyping)
+                End If
+            Catch recovery As Exception
+                mUpdating = False
+                Throw recovery
+            End Try
+            ' BUI-015: a rethrow can bypass Finally on current toolchains.
+            mUpdating = False
+            Throw e
+        Finally
+            mUpdating = False
+        End Try
+        mDocument = document
+        mStart = start
+        mLength = length
+        mTyping = typing.Copy()
+    End Sub
+    Public Sub Open()
+        If IsOpen Then Return
+        If mState <> Nil Then Close()
+        If NativeWidget = Nil Then Throw New InvalidArgumentException("Attach StyledTextEditor before Open")
+        Dim state As New RichState()
+        state.Host = NativeWidget
+        For i As Integer = 0 To Array.Count(RichRegistry.Items) - 1
+            If RichRegistry.Items(i).Editor Is Nil And RichRegistry.Items(i).State Is Nil Then
+                state.ID = i
+                Exit For
+            End If
+        Next
+        If state.ID < 0 Then
+            If Array.Count(RichRegistry.Items) >= 256 Then Throw New InvalidArgumentException("Too many open styled editors")
+            state.ID = Array.Count(RichRegistry.Items)
+            Array.Append(RichRegistry.Items, New RichOwner())
+        End If
+        mState = state
+        RichRegistry.Items(state.ID).Editor = Me
+        RichRegistry.Items(state.ID).State = state
+        mUpdating = True
+        Try
+            RichNativeOpen(state)
+            RefreshNative()
+            RichNativeEditable(state, Not mReadOnly)
+            Commit(mDocument, mStart, mLength, mTyping, True)
+            LastNativeError = ""
+        Catch e As Exception
+            mUpdating = False
+            Close()
+            Throw e
+        Finally
+            mUpdating = False
+        End Try
+    End Sub
+    Public Sub RefreshNative()
+        If IsOpen Then RichNativeSize(mState, Width, Height)
+    End Sub
+    Public Sub FocusEditor()
+        If IsOpen Then RichNativeFocus(mState)
+    End Sub
+    Public Sub Close()
+        If mState Is Nil Then Return
+        Dim state As RichState = mState
+        NativeEditFinished()
+        FlushNativeGroup()
+        CancelNativeGroup()
+        mState = Nil
+        If state.CallbackDepth > 0 Then state.ErrorSink = Me
+        If state.ID >= 0 Then RichRegistry.Items(state.ID).Editor = Nil
+        mUpdating = True
+        Try
+            RichNativeClose(state)
+        Finally
+            mUpdating = False
+        End Try
+    End Sub
+    Public Sub Destructor()
+        Close()
+    End Sub
+    ''' Callback entry; native callbacks never unwind a Buoy exception into C.
+    Public Function NativeUpdating() As Boolean
+        Return mUpdating
+    End Function
+    Public Sub NativeBeginAction()
+        If mUpdating Or Not IsOpen Then Return
+        Try
+            If mGroupDepth = 0 Then
+                mGroupBefore = Snapshot()
+                mGroupChanged = False
+                mGroupMerge = False
+            End If
+            mGroupDepth += 1
+        Catch e As Exception
+            LastNativeError = e.Message
+        End Try
+    End Sub
+    Public Sub NativeEndAction()
+        If mUpdating Or mGroupDepth = 0 Then Return
+        mGroupDepth -= 1
+        If mGroupDepth = 0 Then
+            Try
+                If mGroupChanged And Not mGroupMerge And mGroupBefore <> Nil Then Remember(mGroupBefore)
+            Catch e As Exception
+                LastNativeError = "Native history: " + e.Message
+            Finally
+                mGroupBefore = Nil
+                mGroupChanged = False
+                mGroupMerge = False
+            End Try
+        End If
+    End Sub
+    Private Sub FlushNativeGroup()
+        If mGroupDepth = 0 Then Return
+        mGroupDepth = 1
+        NativeEndAction()
+    End Sub
+    Private Sub RememberNative(before As RichSnapshot, start As Integer, removed As Integer, inserted As String)
+        Dim kind As Integer = 0
+        If removed = 0 And inserted <> "" Then kind = 1
+        If inserted = "" And removed > 0 Then
+            If before.Length > 0 Then
+                kind = 4
+            ElseIf start < before.Start Then
+                kind = 2
+            Else
+                kind = 3
+            End If
+        End If
+        Dim merge As Boolean = False
+        If mNativeStyle <> Nil And mNativeBefore <> Nil And mNativeStyle.Equals(mTyping) Then
+            If kind = 1 And (mNativeKind = 1 Or mNativeKind = 4) And start = mNativeCaret Then merge = True
+            If kind = 2 And mNativeKind = 2 And start + removed = mNativeCaret Then merge = True
+            If kind = 3 And mNativeKind = 3 And start = mNativeCaret Then merge = True
+        End If
+        If mGroupDepth > 0 Then
+            If Not mGroupChanged Then mGroupMerge = merge
+            Remember(before)
+        ElseIf Not merge Then
+            Remember(before)
+        End If
+        Array.Clear(mRedo)
+        If Not merge Then mNativeBefore = before
+        mNativeStyle = mTyping.Copy()
+        mNativeCaret = mStart
+        mNativeKind = kind
+        ' Whitespace closes a typing burst; explicit commands/caret moves do too.
+        If String.Contains(inserted, " ") Or String.Contains(inserted, "\n") Or String.Contains(inserted, "\t") Then mNativeKind = 0
+    End Sub
+    Public Sub NativeRejectEdit()
+        If mUpdating Or Not IsOpen Then Return
+        Dim saved As RichSnapshot = Nil
+        If mGroupChanged Then saved = mGroupBefore
+        If saved Is Nil And mNativeKind = 4 Then
+            saved = mNativeBefore
+            If Array.Count(mUndo) > 0 Then Array.RemoveAt(mUndo, Array.Count(mUndo) - 1)
+        End If
+        If saved Is Nil Then Return
+        Commit(DecodeStyledText(saved.Data), saved.Start, saved.Length, saved.Typing, True)
+        CancelNativeGroup()
+    End Sub
+    Public Sub NativeNormalizedEdit(start As Integer, length As Integer, content As String)
+        Dim active As RichState = mState
+        If active Is Nil Then Return
+        active.CallbackDepth += 1
+        Try
+            If Not NativeAcceptEdit(start, length, content) Then
+                NativeRejectEdit()
+                Return
+            End If
+            Dim before As RichSnapshot = Snapshot()
+            Dim nextDocument As StyledText = RichClone(mDocument)
+            nextDocument.Delete(start, length)
+            nextDocument.Insert(start, content, mTyping)
+            Commit(nextDocument, start + String.Len(content), 0, mTyping, True)
+            RememberNative(before, start, length, content)
+            RaiseEvent DocumentChanged()
+            RaiseEvent SelectionChanged()
+        Catch e As Exception
+            LastNativeError = e.Message
+        Finally
+            RichCallbackFinished(active)
+        End Try
+    End Sub
+    Public Function NativeAcceptEdit(start As Integer, length As Integer, content As String) As Boolean
+        If mUpdating Then Return True
+        If mReadOnly Or Not IsOpen Then Return False
+        Try
+            Dim inserted As New StyledText(content, mTyping)
+            Dim nextDocument As StyledText = RichClone(mDocument)
+            nextDocument.Delete(start, length)
+            nextDocument.Insert(start, content, mTyping)
+            RichValidate(nextDocument)
+            Return True
+        Catch e As Exception
+            LastNativeError = e.Message
+            Return False
+        End Try
+    End Function
+    Public Sub NativeWillReplaceSelection(backspace As Boolean, forwardDelete As Boolean)
+        If mUpdating Or Not IsOpen Then Return
+        Try
+            Dim selection As RichSelection = RichNativeSelection(mState, mDocument.PlainText())
+            RichCheckRange(mDocument, selection.Start, selection.Length)
+            mStart = selection.Start
+            mLength = selection.Length
+            Dim start As Integer = selection.Start
+            Dim length As Integer = selection.Length
+            If length = 0 Then
+                If backspace And start > 0 Then
+                    start -= 1
+                    length = 1
+                ElseIf forwardDelete And start < mDocument.Length() Then
+                    length = 1
+                End If
+            End If
+            NativeWillEdit(start, length)
+        Catch e As Exception
+            LastNativeError = e.Message
+        End Try
+    End Sub
+    Public Sub NativeWillEdit(start As Integer, length As Integer)
+        If mUpdating Or Not IsOpen Then Return
+        RichCheckRange(mDocument, start, length)
+        mEditStart = start
+        mEditLength = length
+    End Sub
+    Public Sub NativeEditFinished()
+        mEditStart = -1
+        mEditLength = 0
+    End Sub
+    Public Sub NativeChanged(widget As Ptr)
+        If Not IsOpen Or mUpdating Or widget <> mState.Entry Then Return
+        Dim activeState As RichState = mState
+        Dim oldStart As Integer = mStart
+        Dim oldLength As Integer = mLength
+        If activeState <> Nil Then activeState.CallbackDepth += 1
+        Try
+        Try
+            If mReadOnly Then
+                Commit(mDocument, mStart, mLength, mTyping, True)
+                Return
+            End If
+            Dim editStart As Integer = mEditStart
+            Dim editLength As Integer = mEditLength
+            NativeEditFinished()
+            Dim content As String = RichNativeRead(mState)
+            Dim sameText As Boolean = String.Compare(content, mDocument.PlainText(), True) = 0
+            If sameText And (editStart < 0 Or editLength = 0) Then Return
+            Dim checked As New StyledText(content)
+            If checked.Length() > 100000 Then Throw New InvalidArgumentException("Editor content exceeds 100000 scalars")
+            Dim oldChars As Array Of String = String.Chars(mDocument.PlainText())
+            Dim newChars As Array Of String = String.Chars(content)
+            Dim prefix As Integer = 0
+            Dim oldCount As Integer = Array.Count(oldChars)
+            Dim newCount As Integer = Array.Count(newChars)
+            Dim selection As RichSelection = RichNativeSelection(mState, content)
+            #If TargetWindows Then
+                ' Rich Edit word/backspace commands may delete more than one scalar.
+                ' Once its WndProc returns, the collapsed caret identifies pure deletion.
+                If mLength = 0 And newCount < oldCount And selection.Length = 0 Then
+                    editStart = selection.Start
+                    editLength = oldCount - newCount
+                End If
+            #End If
+            Dim prefixLimit As Integer = Math.Min(oldCount, newCount)
+            If editStart >= 0 Then prefixLimit = Math.Min(prefixLimit, editStart)
+            While prefix < prefixLimit
+                If String.Compare(oldChars(prefix), newChars(prefix), True) <> 0 Then Exit While
+                prefix += 1
+            End While
+            Dim suffix As Integer = 0
+            Dim suffixLimit As Integer = Math.Min(oldCount, newCount) - prefix
+            If editStart >= 0 Then suffixLimit = Math.Min(suffixLimit, oldCount - editStart - editLength)
+            While suffix < suffixLimit
+                If String.Compare(oldChars(oldCount - suffix - 1), newChars(newCount - suffix - 1), True) <> 0 Then Exit While
+                suffix += 1
+            End While
+            Dim nextDocument As StyledText = RichClone(mDocument)
+            nextDocument.Delete(prefix, oldCount - prefix - suffix)
+            nextDocument.Insert(prefix, String.Substring(content, prefix, newCount - prefix - suffix), mTyping)
+            RichValidate(nextDocument)
+            RichCheckRange(nextDocument, selection.Start, selection.Length)
+            Dim before As RichSnapshot = Snapshot()
+            Commit(nextDocument, selection.Start, selection.Length, mTyping, False)
+            RememberNative(before, prefix, oldCount - prefix - suffix, String.Substring(content, prefix, newCount - prefix - suffix))
+        Catch e As Exception
+            LastNativeError = e.Message
+            Try
+                Commit(mDocument, mStart, mLength, mTyping, True)
+            Catch recovery As Exception
+                LastNativeError += "; recovery: " + recovery.Message
+            End Try
+            Return
+        End Try
+        Try
+            RaiseEvent DocumentChanged()
+            If oldStart <> mStart Or oldLength <> mLength Then RaiseEvent SelectionChanged()
+        Catch e As Exception
+            LastNativeError = e.Message
+        End Try
+        Finally
+            If activeState <> Nil Then RichCallbackFinished(activeState)
+        End Try
+    End Sub
+    Public Sub NativeSelectionChanged(widget As Ptr)
+        If Not IsOpen Or mUpdating Or mEditStart >= 0 Or widget <> mState.Entry Then Return
+        Dim activeState As RichState = mState
+        If activeState <> Nil Then activeState.CallbackDepth += 1
+        Try
+        Try
+            Dim selection As RichSelection = RichNativeSelection(mState, mDocument.PlainText())
+            RichCheckRange(mDocument, selection.Start, selection.Length)
+            If selection.Start = mStart And selection.Length = mLength Then Return
+            mNativeKind = 0
+            mStart = selection.Start
+            mLength = selection.Length
+            mTyping = RichCaretStyle(mDocument, mStart, mLength)
+            RaiseEvent SelectionChanged()
+        Catch e As Exception
+            LastNativeError = e.Message
+        End Try
+        Finally
+            If activeState <> Nil Then RichCallbackFinished(activeState)
+        End Try
+    End Sub
+    Public Function NativeShortcut(key As Integer, shift As Boolean) As Boolean
+        Dim activeState As RichState = mState
+        If activeState <> Nil Then activeState.CallbackDepth += 1
+        Try
+        Try
+            #If TargetWindows Then
+                If key >= 97 Then Return False
+            #End If
+            Select Case key
+                Case 66, 98
+                    SetSelectionBold(Not mTyping.Bold)
+                Case 73, 105
+                    SetSelectionItalic(Not mTyping.Italic)
+                Case 85, 117
+                    SetSelectionUnderline(Not mTyping.Underline)
+                Case 90, 122
+                    If shift Then
+                        Redo()
+                    Else
+                        Undo()
+                    End If
+                Case 89, 121
+                    Redo()
+                Case Else
+                    Return False
+            End Select
+        Catch e As Exception
+            LastNativeError = e.Message
+        End Try
+        Return True
+        Finally
+            If activeState <> Nil Then RichCallbackFinished(activeState)
+        End Try
+    End Function
+    Public Sub NativeDestroyed(widget As Ptr)
+        If mState Is Nil Then Return
+        If widget = mState.Entry Then mState.Entry = Nil
+        If widget = mState.Host Then
+            RichRegistry.Items(mState.ID).Editor = Nil
+            mState.Host = Nil
+            mState.Root = Nil
+            mState.Entry = Nil
+        End If
+    End Sub
+End Class
+
+Private Class RichPendingCleanup
+    Public Shared Property States As Array Of RichState = []
+    Public Shared Property Scheduled As Boolean = False
+End Class
+Private Sub RichDispose(state As RichState)
+    RichNativeDispose(state)
+    If state.ID >= 0 Then
+        If RichRegistry.Items(state.ID).State Is state Then RichRegistry.Items(state.ID).State = Nil
+    End If
+End Sub
+Private Sub RichCallbackFinished(state As RichState)
+    state.CallbackDepth -= 1
+    If state.CallbackDepth = 0 And Array.Count(RichPendingCleanup.States) > 0 And Not RichPendingCleanup.Scheduled Then
+        RichPendingCleanup.Scheduled = True
+        Try
+            RichNativeScheduleCleanup()
+        Catch e As Exception
+            RichPendingCleanup.Scheduled = False
+            Dim owner As StyledTextEditor = state.ErrorSink
+            If owner <> Nil Then owner.LastNativeError = "Deferred cleanup scheduling: " + e.Message
+        End Try
+    End If
+End Sub
+Private Sub RichDrainClosed()
+    RichPendingCleanup.Scheduled = False
+    Dim pending As Array Of RichState = RichPendingCleanup.States
+    RichPendingCleanup.States = []
+    For Each state As RichState In pending
+        If state.CallbackDepth > 0 Then
+            Array.Append(RichPendingCleanup.States, state)
+            Continue For
+        End If
+        Try
+            RichDispose(state)
+        Catch e As Exception
+            ' Keep a failed slot reserved; never reuse live callback identities.
+            Dim owner As StyledTextEditor = state.ErrorSink
+            If owner <> Nil Then owner.LastNativeError = "Deferred native cleanup: " + e.Message
+        End Try
+    Next
+End Sub
+Private Sub RichNativeClose(state As RichState)
+    If state.CallbackDepth > 0 Then
+        Array.Append(RichPendingCleanup.States, state)
+        If Not RichPendingCleanup.Scheduled Then
+            RichPendingCleanup.Scheduled = True
+            Try
+                RichNativeScheduleCleanup()
+            Catch e As Exception
+                RichPendingCleanup.Scheduled = False
+                Dim owner As StyledTextEditor = state.ErrorSink
+                If owner <> Nil Then owner.LastNativeError = "Deferred cleanup scheduling: " + e.Message
+                ' Callback exit retries; keep the native object alive meanwhile.
+            End Try
+        End If
+    Else
+        RichDispose(state)
+    End If
+End Sub
+
+Private Sub RichFlag(style As TextStyle, kind As Integer, value As Boolean)
+    If kind = 1 Then style.Bold = value
+    If kind = 2 Then style.Italic = value
+    If kind = 3 Then style.Underline = value
+End Sub
+Private Function RichGetOwner(id As Ptr) As StyledTextEditor
+    Dim index As Integer = CType(id, Integer) - 1
+    If index < 0 Or index >= Array.Count(RichRegistry.Items) Then Return Nil
+    Return RichRegistry.Items(index).Editor
+End Function
+
+#If TargetLinux Then
+Private Class RichGTKEditIters
+    Public Property Buffer As Ptr
+    Public Property First As Ptr
+    Public Property Last As Ptr
+    Public Shared Property Active As Array Of RichGTKEditIters = []
+End Class
+Private Sub RichGTKTrack(buffer As Ptr, first As Ptr, last As Ptr)
+    Dim item As New RichGTKEditIters()
+    item.Buffer = buffer
+    item.First = first
+    item.Last = last
+    Array.Append(RichGTKEditIters.Active, item)
+End Sub
+Private Sub RichGTKUntrack(first As Ptr)
+    For i As Integer = Array.Count(RichGTKEditIters.Active) - 1 To 0 Step -1
+        If RichGTKEditIters.Active(i).First = first Then
+            Array.RemoveAt(RichGTKEditIters.Active, i)
+            Return
+        End If
+    Next
+End Sub
+Sequential Structure RichIter
+    A0 As Int64
+    A1 As Int64
+    A2 As Int64
+    A3 As Int64
+    A4 As Int64
+    A5 As Int64
+    A6 As Int64
+    A7 As Int64
+    A8 As Int64
+    A9 As Int64
+    A10 As Int64
+    A11 As Int64
+End Structure
+Sequential Structure RichGValue
+    TypeID As UInt64
+    A As UInt64
+    B As UInt64
+End Structure
+Sequential Structure RichRGBA
+    Red As Single
+    Green As Single
+    Blue As Single
+    Alpha As Single
+End Structure
+Private Delegate Sub RichGTKCallback(buffer As Ptr, data As Ptr)
+Private Delegate Sub RichGTKMarkCallback(buffer As Ptr, iter As Ptr, mark As Ptr, data As Ptr)
+Private Delegate Sub RichGTKInsertCallback(buffer As Ptr, iter As Ptr, content As Ptr, length As Int32, data As Ptr)
+Private Delegate Sub RichGTKDeleteCallback(buffer As Ptr, first As Ptr, last As Ptr, data As Ptr)
+Private Delegate Function RichGTKKeyCallback(controller As Ptr, keyval As UInt32, keycode As UInt32, modifiers As UInt32, data As Ptr) As Int32
+Private Optional Declare Function RScrollNew Lib "libgtk-4.so.1" Alias "gtk_scrolled_window_new" () As Ptr
+Private Optional Declare Function RCSSNew Lib "libgtk-4.so.1" Alias "gtk_css_provider_new" () As Ptr
+Private Optional Declare Sub RCSSLoad Lib "libgtk-4.so.1" Alias "gtk_css_provider_load_from_data" (provider As Ptr, data As String, length As Integer)
+Private Optional Declare Function RStyleContext Lib "libgtk-4.so.1" Alias "gtk_widget_get_style_context" (view As Ptr) As Ptr
+Private Optional Declare Sub RAddProvider Lib "libgtk-4.so.1" Alias "gtk_style_context_add_provider" (context As Ptr, provider As Ptr, priority As UInt32)
+Private Optional Declare Function RTextNew Lib "libgtk-4.so.1" Alias "gtk_text_view_new" () As Ptr
+Private Optional Declare Function RRefSink Lib "libgobject-2.0.so.0" Alias "g_object_ref_sink" (obj As Ptr) As Ptr
+Private Optional Declare Sub RUnref Lib "libgobject-2.0.so.0" Alias "g_object_unref" (obj As Ptr)
+Private Optional Declare Sub RScrollChild Lib "libgtk-4.so.1" Alias "gtk_scrolled_window_set_child" (scroll As Ptr, child As Ptr)
+Private Optional Declare Sub RPut Lib "libgtk-4.so.1" Alias "gtk_fixed_put" (host As Ptr, child As Ptr, x As Double, y As Double)
+Private Optional Declare Function RParent Lib "libgtk-4.so.1" Alias "gtk_widget_get_parent" (widget As Ptr) As Ptr
+Private Optional Declare Sub RRemove Lib "libgtk-4.so.1" Alias "gtk_fixed_remove" (host As Ptr, child As Ptr)
+Private Optional Declare Function RBuffer Lib "libgtk-4.so.1" Alias "gtk_text_view_get_buffer" (view As Ptr) As Ptr
+Private Optional Declare Sub RSize Lib "libgtk-4.so.1" Alias "gtk_widget_set_size_request" (widget As Ptr, width As Int32, height As Int32)
+Private Optional Declare Sub RWrap Lib "libgtk-4.so.1" Alias "gtk_text_view_set_wrap_mode" (view As Ptr, mode As Int32)
+Private Optional Declare Sub REditable Lib "libgtk-4.so.1" Alias "gtk_text_view_set_editable" (view As Ptr, enabled As Int32)
+Private Optional Declare Sub RUndoEnabled Lib "libgtk-4.so.1" Alias "gtk_text_buffer_set_enable_undo" (buffer As Ptr, enabled As Int32)
+Private Optional Declare Function RFocus Lib "libgtk-4.so.1" Alias "gtk_widget_grab_focus" (widget As Ptr) As Int32
+Private Optional Declare Function RConnect Lib "libgobject-2.0.so.0" Alias "g_signal_connect_data" (obj As Ptr, signal As String, callback As Ptr, data As Ptr, destroy As Ptr, options As Int32) As UInt64
+Private Optional Declare Sub RStopSignal Lib "libgobject-2.0.so.0" Alias "g_signal_stop_emission_by_name" (obj As Ptr, signal As String)
+Private Optional Declare Sub RDisconnect Lib "libgobject-2.0.so.0" Alias "g_signal_handler_disconnect" (obj As Ptr, id As UInt64)
+Private Optional Declare Function RKeyController Lib "libgtk-4.so.1" Alias "gtk_event_controller_key_new" () As Ptr
+Private Optional Declare Sub RAddController Lib "libgtk-4.so.1" Alias "gtk_widget_add_controller" (view As Ptr, controller As Ptr)
+Private Optional Declare Sub RControllerPhase Lib "libgtk-4.so.1" Alias "gtk_event_controller_set_propagation_phase" (controller As Ptr, phase As Int32)
+Private Optional Declare Sub RBounds Lib "libgtk-4.so.1" Alias "gtk_text_buffer_get_bounds" (buffer As Ptr, ByRef first As RichIter, ByRef last As RichIter)
+Private Optional Declare Function RGetText Lib "libgtk-4.so.1" Alias "gtk_text_buffer_get_text" (buffer As Ptr, ByRef first As RichIter, ByRef last As RichIter, hidden As Int32) As CString
+Private Optional Declare Sub RFree Lib "libglib-2.0.so.0" Alias "g_free" (obj As Ptr)
+Private Optional Declare Function RCharCount Lib "libgtk-4.so.1" Alias "gtk_text_buffer_get_char_count" (buffer As Ptr) As Int32
+Private Optional Declare Sub RSetText Lib "libgtk-4.so.1" Alias "gtk_text_buffer_set_text" (buffer As Ptr, content As String, length As Int32)
+Private Optional Declare Sub RAt Lib "libgtk-4.so.1" Alias "gtk_text_buffer_get_iter_at_offset" (buffer As Ptr, ByRef iter As RichIter, offset As Int32)
+Private Optional Declare Sub RAtPointer Lib "libgtk-4.so.1" Alias "gtk_text_buffer_get_iter_at_offset" (buffer As Ptr, iter As Ptr, offset As Int32)
+Private Optional Declare Sub RSelect Lib "libgtk-4.so.1" Alias "gtk_text_buffer_select_range" (buffer As Ptr, ByRef insertion As RichIter, ByRef bound As RichIter)
+Private Optional Declare Function RSelection Lib "libgtk-4.so.1" Alias "gtk_text_buffer_get_selection_bounds" (buffer As Ptr, ByRef first As RichIter, ByRef last As RichIter) As Int32
+Private Optional Declare Function ROffset Lib "libgtk-4.so.1" Alias "gtk_text_iter_get_offset" (ByRef iter As RichIter) As Int32
+Private Optional Declare Function ROffsetPtr Lib "libgtk-4.so.1" Alias "gtk_text_iter_get_offset" (iter As Ptr) As Int32
+Private Optional Declare Function RTagTable Lib "libgtk-4.so.1" Alias "gtk_text_buffer_get_tag_table" (buffer As Ptr) As Ptr
+Private Optional Declare Function RTagNew Lib "libgtk-4.so.1" Alias "gtk_text_tag_new" (name As Ptr) As Ptr
+Private Optional Declare Function RTagAdd Lib "libgtk-4.so.1" Alias "gtk_text_tag_table_add" (table As Ptr, tag As Ptr) As Int32
+Private Optional Declare Sub RTagRemove Lib "libgtk-4.so.1" Alias "gtk_text_tag_table_remove" (table As Ptr, tag As Ptr)
+Private Optional Declare Sub RApplyTag Lib "libgtk-4.so.1" Alias "gtk_text_buffer_apply_tag" (buffer As Ptr, tag As Ptr, ByRef first As RichIter, ByRef last As RichIter)
+Private Optional Declare Sub RRemoveTags Lib "libgtk-4.so.1" Alias "gtk_text_buffer_remove_all_tags" (buffer As Ptr, ByRef first As RichIter, ByRef last As RichIter)
+Private Optional Declare Function RValueInit Lib "libgobject-2.0.so.0" Alias "g_value_init" (ByRef value As RichGValue, typeID As UInt64) As Ptr
+Private Optional Declare Sub RValueUnset Lib "libgobject-2.0.so.0" Alias "g_value_unset" (ByRef value As RichGValue)
+Private Optional Declare Sub RValueBoxed Lib "libgobject-2.0.so.0" Alias "g_value_set_boxed" (ByRef value As RichGValue, boxed As Ptr)
+Private Optional Declare Sub RValueColor Lib "libgobject-2.0.so.0" Alias "g_value_set_boxed" (ByRef value As RichGValue, ByRef color As RichRGBA)
+Private Optional Declare Sub RValueInt Lib "libgobject-2.0.so.0" Alias "g_value_set_enum" (ByRef value As RichGValue, number As Int32)
+Private Optional Declare Sub RSetProperty Lib "libgobject-2.0.so.0" Alias "g_object_set_property" (obj As Ptr, name As String, ByRef value As RichGValue)
+Private Optional Declare Function RFontType Lib "libpango-1.0.so.0" Alias "pango_font_description_get_type" () As UInt64
+Private Optional Declare Function RColorType Lib "libgtk-4.so.1" Alias "gdk_rgba_get_type" () As UInt64
+Private Optional Declare Function RUnderlineType Lib "libpango-1.0.so.0" Alias "pango_underline_get_type" () As UInt64
+Private Optional Declare Function RFontNew Lib "libpango-1.0.so.0" Alias "pango_font_description_new" () As Ptr
+Private Optional Declare Sub RFontFree Lib "libpango-1.0.so.0" Alias "pango_font_description_free" (font As Ptr)
+Private Optional Declare Sub RFontFamily Lib "libpango-1.0.so.0" Alias "pango_font_description_set_family" (font As Ptr, name As String)
+Private Optional Declare Sub RFontSize Lib "libpango-1.0.so.0" Alias "pango_font_description_set_size" (font As Ptr, size As Int32)
+Private Optional Declare Sub RFontWeight Lib "libpango-1.0.so.0" Alias "pango_font_description_set_weight" (font As Ptr, weight As Int32)
+Private Optional Declare Sub RFontStyle Lib "libpango-1.0.so.0" Alias "pango_font_description_set_style" (font As Ptr, style As Int32)
+
+Private Delegate Function RichGTKIdle(data As Ptr) As Int32
+Private Optional Declare Function RIdle Lib "libglib-2.0.so.0" Alias "g_idle_add_full" (priority As Int32, callback As RichGTKIdle, data As Ptr, destroy As Ptr) As UInt32
+Private Sub RichNativeScheduleCleanup()
+    If RIdle(0, AddressOf RichGTKDrain, Nil, Nil) = 0 Then Throw New Exception("Could not schedule GTK editor cleanup")
+End Sub
+Private Function RichGTKDrain(data As Ptr) As Int32
+    RichDrainClosed()
+    Return 0
+End Function
+
+Private Sub RichNativeOpen(state As RichState)
+    state.Root = RScrollNew()
+    If state.Root = Nil Then Throw New Exception("Could not create GTK scroll view")
+    RRefSink(state.Root)
+    state.Entry = RTextNew()
+    If state.Entry = Nil Then Throw New Exception("Could not create GTK text view")
+    Dim css As Ptr = RCSSNew()
+    If css = Nil Then Throw New Exception("Could not create editor appearance")
+    RCSSLoad(css, "textview, textview text { background-color: white; color: black; }", -1)
+    RAddProvider(RStyleContext(state.Entry), css, 800)
+    RUnref(css)
+    RScrollChild(state.Root, state.Entry)
+    RPut(state.Host, state.Root, 0.0, 0.0)
+    RWrap(state.Entry, 3)
+    state.Buffer = RBuffer(state.Entry)
+    RUndoEnabled(state.Buffer, 0)
+    Dim changed As RichGTKCallback = AddressOf RichGTKChanged
+    Dim marked As RichGTKMarkCallback = AddressOf RichGTKMarked
+    Dim insertBefore As RichGTKInsertCallback = AddressOf RichGTKInserting
+    Dim insertAfter As RichGTKInsertCallback = AddressOf RichGTKInserted
+    Dim deleteBefore As RichGTKDeleteCallback = AddressOf RichGTKDeleting
+    Dim deleteAfter As RichGTKDeleteCallback = AddressOf RichGTKDeleted
+    Array.Append(state.Signals, RConnect(state.Buffer, "changed", CType(changed, Ptr), CType(state.ID + 1, Ptr), Nil, 0))
+    Array.Append(state.Signals, RConnect(state.Buffer, "mark-set", CType(marked, Ptr), CType(state.ID + 1, Ptr), Nil, 0))
+    Array.Append(state.Signals, RConnect(state.Buffer, "insert-text", CType(insertBefore, Ptr), CType(state.ID + 1, Ptr), Nil, 0))
+    Array.Append(state.Signals, RConnect(state.Buffer, "insert-text", CType(insertAfter, Ptr), CType(state.ID + 1, Ptr), Nil, 1))
+    Array.Append(state.Signals, RConnect(state.Buffer, "delete-range", CType(deleteBefore, Ptr), CType(state.ID + 1, Ptr), Nil, 0))
+    Array.Append(state.Signals, RConnect(state.Buffer, "delete-range", CType(deleteAfter, Ptr), CType(state.ID + 1, Ptr), Nil, 1))
+    Dim beginAction As RichGTKCallback = AddressOf RichGTKBegin
+    Dim endAction As RichGTKCallback = AddressOf RichGTKEnd
+    Array.Append(state.Signals, RConnect(state.Buffer, "begin-user-action", CType(beginAction, Ptr), CType(state.ID + 1, Ptr), Nil, 0))
+    Array.Append(state.Signals, RConnect(state.Buffer, "end-user-action", CType(endAction, Ptr), CType(state.ID + 1, Ptr), Nil, 0))
+    state.KeyController = RKeyController()
+    RControllerPhase(state.KeyController, 1)
+    Dim key As RichGTKKeyCallback = AddressOf RichGTKKey
+    RConnect(state.KeyController, "key-pressed", CType(key, Ptr), CType(state.ID + 1, Ptr), Nil, 0)
+    RAddController(state.Entry, state.KeyController)
+End Sub
+Private Sub RichNativeDispose(state As RichState)
+    If state.Buffer <> Nil Then
+        For Each id As UInt64 In state.Signals
+            RDisconnect(state.Buffer, id)
+        Next
+        RichClearTags(state)
+    End If
+    If state.Root <> Nil Then
+        Dim parent As Ptr = RParent(state.Root)
+        If parent <> Nil Then RRemove(parent, state.Root)
+        RUnref(state.Root)
+    End If
+    state.Root = Nil
+    state.Entry = Nil
+    state.Buffer = Nil
+End Sub
+Private Sub RichNativeSize(state As RichState, width As Integer, height As Integer)
+    RSize(state.Root, Math.Max(1, width), Math.Max(1, height))
+End Sub
+Private Sub RichNativeFocus(state As RichState)
+    RFocus(state.Entry)
+End Sub
+Private Sub RichNativeEditable(state As RichState, enabled As Boolean)
+    Dim native As Int32 = 0
+    If enabled Then native = 1
+    REditable(state.Entry, native)
+End Sub
+Private Function RichNativeRead(state As RichState) As String
+    Dim count As Integer = RCharCount(state.Buffer)
+    If count > 100000 Then Throw New InvalidArgumentException("Native text exceeds editor limit")
+    Dim first As RichIter
+    Dim last As RichIter
+    RBounds(state.Buffer, first, last)
+    Dim data As CString = RGetText(state.Buffer, first, last, 1)
+    Dim content As String = CType(data, String)
+    RFree(CType(data, Ptr))
+    If String.Len(content) <> count Then Throw New InvalidArgumentException("Native content contains an unsupported scalar")
+    Return content
+End Function
+Private Sub RichNativeWrite(state As RichState, content As String)
+    RSetText(state.Buffer, content, String.LenBytes(content))
+End Sub
+Private Function RichNativeSelection(state As RichState, content As String) As RichSelection
+    Dim first As RichIter
+    Dim last As RichIter
+    RSelection(state.Buffer, first, last)
+    Dim selection As New RichSelection()
+    selection.Start = ROffset(first)
+    selection.Length = ROffset(last) - selection.Start
+    Return selection
+End Function
+Private Sub RichNativeSelect(state As RichState, content As String, start As Integer, length As Integer)
+    Dim first As RichIter
+    Dim last As RichIter
+    RAt(state.Buffer, first, start)
+    RAt(state.Buffer, last, start + length)
+    RSelect(state.Buffer, last, first)
+End Sub
+Private Sub RichNativeTyping(state As RichState, style As TextStyle)
+    ' GTK insertion attributes are applied by the bounded model reconciliation.
+End Sub
+Private Sub RichClearTags(state As RichState)
+    Dim table As Ptr = RTagTable(state.Buffer)
+    For Each tag As Ptr In state.Tags
+        RTagRemove(table, tag)
+        RUnref(tag)
+    Next
+    Array.Clear(state.Tags)
+End Sub
+Private Sub RichNativeRender(state As RichState, document As StyledText)
+    Dim first As RichIter
+    Dim last As RichIter
+    RBounds(state.Buffer, first, last)
+    RRemoveTags(state.Buffer, first, last)
+    RichClearTags(state)
+    For Each run As StyleRun In document.Runs()
+        Dim tag As Ptr = RTagNew(Nil)
+        If tag = Nil Then Throw New Exception("Could not allocate GTK style tag")
+        If RTagAdd(RTagTable(state.Buffer), tag) = 0 Then
+            RUnref(tag)
+            Throw New Exception("Could not register GTK style tag")
+        End If
+        Array.Append(state.Tags, tag)
+        Dim font As Ptr = RFontNew()
+        If font = Nil Then Throw New Exception("Could not allocate font description")
+        Try
+            If run.Style.FontName <> "" Then RFontFamily(font, run.Style.FontName)
+            Dim size As Double = run.Style.FontSize
+            If size = 0.0 Then size = 12.0
+            RFontSize(font, size * 1024.0 + 0.5)
+            Dim weight As Int32 = 400
+            If run.Style.Bold Then weight = 700
+            RFontWeight(font, weight)
+            Dim slant As Int32 = 0
+            If run.Style.Italic Then slant = 2
+            RFontStyle(font, slant)
+            Dim value As RichGValue
+            RValueInit(value, RFontType())
+            RValueBoxed(value, font)
+            RSetProperty(tag, "font-desc", value)
+            RValueUnset(value)
+            RValueInit(value, RUnderlineType())
+            Dim underline As Int32 = 0
+            If run.Style.Underline Then underline = 1
+            RValueInt(value, underline)
+            RSetProperty(tag, "underline", value)
+            RValueUnset(value)
+            Dim color As RichRGBA
+            color.Red = run.Style.Red / 65535.0
+            color.Green = run.Style.Green / 65535.0
+            color.Blue = run.Style.Blue / 65535.0
+            color.Alpha = 1.0
+            RValueInit(value, RColorType())
+            RValueColor(value, color)
+            RSetProperty(tag, "foreground-rgba", value)
+            RValueUnset(value)
+        Finally
+            RFontFree(font)
+        End Try
+        RAt(state.Buffer, first, run.Start)
+        RAt(state.Buffer, last, run.Start + run.Length)
+        RApplyTag(state.Buffer, tag, first, last)
+    Next
+End Sub
+Private Sub RichGTKBegin(buffer As Ptr, data As Ptr)
+    Dim owner As StyledTextEditor = RichGetOwner(data)
+    If owner <> Nil Then owner.NativeBeginAction()
+End Sub
+Private Sub RichGTKEnd(buffer As Ptr, data As Ptr)
+    Dim owner As StyledTextEditor = RichGetOwner(data)
+    If owner <> Nil Then owner.NativeEndAction()
+End Sub
+Private Sub RichGTKChanged(buffer As Ptr, data As Ptr)
+    Dim owner As StyledTextEditor = RichGetOwner(data)
+    If owner Is Nil Or owner.NativeUpdating() Then Return
+    Dim state As RichState = RichRegistry.Items(CType(data, Integer) - 1).State
+    Dim content As String = RichNativeRead(state)
+    owner.NativeChanged(owner.TextHandle)
+    If String.Compare(content, owner.Text, True) <> 0 Then
+        ' A handler may replace the entire buffer during GTK's default edit.
+        ' Revalidate its still-live iterators before the default handler resumes.
+        For Each item As RichGTKEditIters In RichGTKEditIters.Active
+            If item.Buffer = buffer Then
+                RAtPointer(buffer, item.First, owner.SelectionStart)
+                If item.Last <> Nil Then RAtPointer(buffer, item.Last, owner.SelectionStart)
+            End If
+        Next
+    End If
+End Sub
+Private Sub RichGTKMarked(buffer As Ptr, iter As Ptr, mark As Ptr, data As Ptr)
+    Dim owner As StyledTextEditor = RichGetOwner(data)
+    If owner <> Nil Then owner.NativeSelectionChanged(owner.TextHandle)
+End Sub
+Private Sub RichGTKInserting(buffer As Ptr, iter As Ptr, content As Ptr, length As Int32, data As Ptr)
+    Dim owner As StyledTextEditor = RichGetOwner(data)
+    If owner Is Nil Or length = 0 Or owner.NativeUpdating() Then Return
+    Try
+        If length < 0 Or length > 400000 Then Throw New InvalidArgumentException("Native insertion exceeds byte limit")
+        Dim bytes As New Bytes()
+        bytes.Append(content, length)
+        For i As Integer = 0 To bytes.Count - 1
+            If bytes.Item(i) = 0 Then Throw New InvalidArgumentException("Native insertion contains NUL")
+        Next
+        Dim inserted As String = bytes.ToString(Text.Encodings.UTF8)
+        If String.Contains(inserted, "\r") Then
+            RStopSignal(buffer, "insert-text")
+            inserted = String.Replace(String.Replace(inserted, "\r\n", "\n"), "\r", "\n")
+            owner.NativeNormalizedEdit(ROffsetPtr(iter), 0, inserted)
+            RAtPointer(buffer, iter, owner.SelectionStart)
+            Return
+        End If
+        If Not owner.NativeAcceptEdit(ROffsetPtr(iter), 0, inserted) Then
+            RStopSignal(buffer, "insert-text")
+            owner.NativeRejectEdit()
+            RAtPointer(buffer, iter, owner.SelectionStart)
+            Return
+        End If
+        owner.NativeWillEdit(ROffsetPtr(iter), 0)
+        RichGTKTrack(buffer, iter, Nil)
+    Catch e As Exception
+        owner.LastNativeError = e.Message
+        RStopSignal(buffer, "insert-text")
+        owner.NativeRejectEdit()
+        RAtPointer(buffer, iter, owner.SelectionStart)
+    End Try
+End Sub
+Private Sub RichGTKInserted(buffer As Ptr, iter As Ptr, content As Ptr, length As Int32, data As Ptr)
+    RichGTKUntrack(iter)
+    Dim owner As StyledTextEditor = RichGetOwner(data)
+    If owner <> Nil Then owner.NativeEditFinished()
+End Sub
+Private Sub RichGTKDeleting(buffer As Ptr, first As Ptr, last As Ptr, data As Ptr)
+    Dim owner As StyledTextEditor = RichGetOwner(data)
+    If owner Is Nil Then Return
+    If owner.NativeUpdating() Then Return
+    Try
+        Dim start As Integer = ROffsetPtr(first)
+        Dim length As Integer = ROffsetPtr(last) - start
+        If Not owner.NativeAcceptEdit(start, length, "") Then
+            RStopSignal(buffer, "delete-range")
+            Return
+        End If
+        owner.NativeWillEdit(start, length)
+        RichGTKTrack(buffer, first, last)
+    Catch e As Exception
+        owner.LastNativeError = e.Message
+        RStopSignal(buffer, "delete-range")
+    End Try
+End Sub
+Private Sub RichGTKDeleted(buffer As Ptr, first As Ptr, last As Ptr, data As Ptr)
+    RichGTKUntrack(first)
+    Dim owner As StyledTextEditor = RichGetOwner(data)
+    If owner <> Nil Then owner.NativeEditFinished()
+End Sub
+Private Function RichGTKKey(controller As Ptr, keyval As UInt32, keycode As UInt32, modifiers As UInt32, data As Ptr) As Int32
+    If (modifiers And 4) = 0 Or (modifiers And 8) <> 0 Then Return 0
+    Dim owner As StyledTextEditor = RichGetOwner(data)
+    If owner Is Nil Then Return 0
+    If owner.NativeShortcut(keyval, (modifiers And 1) <> 0) Then Return 1
+    Return 0
+End Function
+#End If
+
+#If TargetMac Then
+Sequential Structure RichRect
+    X As Double
+    Y As Double
+    Width As Double
+    Height As Double
+End Structure
+Sequential Structure RichSize
+    Width As Double
+    Height As Double
+End Structure
+Sequential Structure RichRange
+    Location As Integer
+    Length As Integer
+End Structure
+Sequential Structure RichSuper
+    Receiver As Ptr
+    Parent As Ptr
+End Structure
+Private Delegate Sub RichMacAction(receiver As Ptr, actionSelector As Ptr, sender As Ptr)
+Private Delegate Function RichMacEdit(receiver As Ptr, actionSelector As Ptr, view As Ptr, range As RichRange, replacement As Ptr) As UInt8
+Private Declare Function MClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+Private Declare Function MSelector Lib "objc" Alias "sel_registerName" (name As String) As Ptr
+Private Declare Function MAllocateClass Lib "objc" Alias "objc_allocateClassPair" (parent As Ptr, name As String, extra As Integer) As Ptr
+Private Declare Sub MRegisterClass Lib "objc" Alias "objc_registerClassPair" (cls As Ptr)
+Private Declare Function MAddMethod Lib "objc" Alias "class_addMethod" (cls As Ptr, actionSelector As Ptr, callback As Ptr, encoding As String) As UInt8
+Private Declare Sub MSuperKey Lib "objc" Alias "objc_msgSendSuper" (ByRef receiver As RichSuper, actionSelector As Ptr, sender As Ptr)
+Private Declare Function MNew Lib "Foundation" Selector "new" (cls As Ptr) As Ptr
+Private Declare Function MAlloc Lib "Foundation" Selector "alloc" (cls As Ptr) As Ptr
+Private Declare Function MInitFrame Lib "AppKit" Selector "initWithFrame:" (obj As Ptr, frame As RichRect) As Ptr
+Private Declare Sub MRelease Lib "Foundation" Selector "release" (obj As Ptr)
+Private Declare Sub MDrain Lib "Foundation" Selector "drain" (pool As Ptr)
+Private Declare Sub MAddSubview Lib "AppKit" Selector "addSubview:" (host As Ptr, child As Ptr)
+Private Declare Sub MRemove Lib "AppKit" Selector "removeFromSuperview" (view As Ptr)
+Private Declare Sub MDocumentView Lib "AppKit" Selector "setDocumentView:" (scroll As Ptr, view As Ptr)
+Private Declare Sub MVerticalScroll Lib "AppKit" Selector "setHasVerticalScroller:" (scroll As Ptr, enabled As Boolean)
+Private Declare Sub MHorizontalScroll Lib "AppKit" Selector "setHasHorizontalScroller:" (scroll As Ptr, enabled As Boolean)
+Private Declare Sub MAutoresizing Lib "AppKit" Selector "setAutoresizingMask:" (view As Ptr, mask As Integer)
+Private Declare Sub MFrame Lib "AppKit" Selector "setFrame:" (view As Ptr, frame As RichRect)
+Private Declare Sub MDelegate Lib "AppKit" Selector "setDelegate:" (view As Ptr, target As Ptr)
+Private Declare Sub MRich Lib "AppKit" Selector "setRichText:" (view As Ptr, enabled As Boolean)
+Private Declare Sub MAllowsUndo Lib "AppKit" Selector "setAllowsUndo:" (view As Ptr, enabled As Boolean)
+Private Declare Function MWhite Lib "AppKit" Selector "whiteColor" (cls As Ptr) As Ptr
+Private Declare Function MBlack Lib "AppKit" Selector "blackColor" (cls As Ptr) As Ptr
+Private Declare Sub MBackground Lib "AppKit" Selector "setBackgroundColor:" (view As Ptr, color As Ptr)
+Private Declare Sub MCaretColor Lib "AppKit" Selector "setInsertionPointColor:" (view As Ptr, color As Ptr)
+Private Declare Sub MEditable Lib "AppKit" Selector "setEditable:" (view As Ptr, enabled As Boolean)
+Private Declare Sub MHorizontalResize Lib "AppKit" Selector "setHorizontallyResizable:" (view As Ptr, enabled As Boolean)
+Private Declare Sub MVerticalResize Lib "AppKit" Selector "setVerticallyResizable:" (view As Ptr, enabled As Boolean)
+Private Declare Sub MMaxSize Lib "AppKit" Selector "setMaxSize:" (view As Ptr, size As RichSize)
+Private Declare Function MTextContainer Lib "AppKit" Selector "textContainer" (view As Ptr) As Ptr
+Private Declare Sub MTracksWidth Lib "AppKit" Selector "setWidthTracksTextView:" (container As Ptr, enabled As Boolean)
+Private Declare Function MStorage Lib "AppKit" Selector "textStorage" (view As Ptr) As Ptr
+Private Declare Function MText Lib "AppKit" Selector "string" (view As Ptr) As Ptr
+Private Declare Function MTextLength Lib "Foundation" Selector "length" (content As Ptr) As Integer
+Private Declare Function MUTF8 Lib "Foundation" Selector "UTF8String" (content As Ptr) As String
+Private Declare Sub MSetText Lib "AppKit" Selector "setString:" (view As Ptr, content As Ptr)
+Private Declare Function MSelection Lib "AppKit" Selector "selectedRange" (view As Ptr) As RichRange
+Private Declare Sub MSelect Lib "AppKit" Selector "setSelectedRange:" (view As Ptr, range As RichRange)
+Private Declare Sub MTyping Lib "AppKit" Selector "setTypingAttributes:" (view As Ptr, attributes As Ptr)
+Private Declare Sub MBegin Lib "Foundation" Selector "beginEditing" (storage As Ptr)
+Private Declare Sub MEnd Lib "Foundation" Selector "endEditing" (storage As Ptr)
+Private Declare Sub MAttributes Lib "Foundation" Selector "setAttributes:range:" (storage As Ptr, attributes As Ptr, range As RichRange)
+Private Declare Sub MSetAttribute Lib "Foundation" Selector "setObject:forKey:" (dict As Ptr, value As Ptr, key As Ptr)
+Private Declare Function MFontNamed Lib "AppKit" Selector "fontWithName:size:" (cls As Ptr, name As Ptr, size As Double) As Ptr
+Private Declare Function MSystemFont Lib "AppKit" Selector "systemFontOfSize:" (cls As Ptr, size As Double) As Ptr
+Private Declare Function MFontManager Lib "AppKit" Selector "sharedFontManager" (cls As Ptr) As Ptr
+Private Declare Function MFontTrait Lib "AppKit" Selector "convertFont:toHaveTrait:" (manager As Ptr, font As Ptr, trait As Integer) As Ptr
+Private Declare Function MFontNoTrait Lib "AppKit" Selector "convertFont:toNotHaveTrait:" (manager As Ptr, font As Ptr, trait As Integer) As Ptr
+Private Declare Function MColor Lib "AppKit" Selector "colorWithSRGBRed:green:blue:alpha:" (cls As Ptr, red As Double, green As Double, blue As Double, alpha As Double) As Ptr
+Private Declare Function MInteger Lib "Foundation" Selector "numberWithInteger:" (cls As Ptr, number As Integer) As Ptr
+Private Declare Function MWindow Lib "AppKit" Selector "window" (view As Ptr) As Ptr
+Private Declare Function MResponder Lib "AppKit" Selector "makeFirstResponder:" (window As Ptr, view As Ptr) As Boolean
+Private Declare Function MModifiers Lib "AppKit" Selector "modifierFlags" (nativeEvent As Ptr) As Integer
+Private Declare Function MKey Lib "AppKit" Selector "charactersIgnoringModifiers" (nativeEvent As Ptr) As Ptr
+
+Private Function RichMacOwner(receiver As Ptr) As StyledTextEditor
+    For Each item As RichOwner In RichRegistry.Items
+        Dim owner As StyledTextEditor = item.Editor
+        If owner <> Nil Then
+            If owner.TextHandle = receiver Then Return owner
+        End If
+    Next
+    Return Nil
+End Function
+Private Function RichMacClass() As Ptr
+    Dim cls As Ptr = MClass("BuoyStyledTextEditorV1")
+    If cls <> Nil Then Return cls
+    cls = MAllocateClass(MClass("NSTextView"), "BuoyStyledTextEditorV1", 0)
+    If cls = Nil Then Throw New Exception("Could not allocate NSTextView subclass")
+    Dim changed As RichMacAction = AddressOf RichMacChanged
+    Dim selection As RichMacAction = AddressOf RichMacSelection
+    Dim key As RichMacAction = AddressOf RichMacKey
+    Dim editing As RichMacEdit = AddressOf RichMacEditing
+    If MAddMethod(cls, MSelector("textDidChange:"), CType(changed, Ptr), "v@:@") = 0 Then Throw New Exception("Could not register text delegate")
+    If MAddMethod(cls, MSelector("textViewDidChangeSelection:"), CType(selection, Ptr), "v@:@") = 0 Then Throw New Exception("Could not register selection delegate")
+    If MAddMethod(cls, MSelector("keyDown:"), CType(key, Ptr), "v@:@") = 0 Then Throw New Exception("Could not register keyboard handler")
+    Dim editEncoding As String = "c@:@{_NSRange=QQ}@"
+    #If TargetArm Then
+        editEncoding = "B@:@{_NSRange=QQ}@"
+    #End If
+    If MAddMethod(cls, MSelector("textView:shouldChangeTextInRange:replacementString:"), CType(editing, Ptr), editEncoding) = 0 Then Throw New Exception("Could not register editing delegate")
+    MRegisterClass(cls)
+    Return cls
+End Function
+Private Class RichMacCleanupTarget
+    Public Shared Property Target As Ptr = Nil
+End Class
+Private Declare Sub MPerformLater Lib "Foundation" Selector "performSelector:withObject:afterDelay:" (target As Ptr, actionSelector As Ptr, argument As Ptr, delay As Double)
+Private Sub RichNativeScheduleCleanup()
+    If RichMacCleanupTarget.Target = Nil Then
+        Dim cls As Ptr = MClass("BuoyStyledEditorCleanupV1")
+        If cls = Nil Then
+            cls = MAllocateClass(MClass("NSObject"), "BuoyStyledEditorCleanupV1", 0)
+            If cls = Nil Then Throw New Exception("Could not allocate editor cleanup target")
+            Dim callback As RichMacAction = AddressOf RichMacDrain
+            If MAddMethod(cls, MSelector("drainEditors:"), CType(callback, Ptr), "v@:@") = 0 Then Throw New Exception("Could not register editor cleanup")
+            MRegisterClass(cls)
+        End If
+        RichMacCleanupTarget.Target = MNew(cls)
+    End If
+    MPerformLater(RichMacCleanupTarget.Target, MSelector("drainEditors:"), Nil, 0.0)
+End Sub
+Private Sub RichMacDrain(receiver As Ptr, actionSelector As Ptr, argument As Ptr)
+    RichDrainClosed()
+End Sub
+
+Private Sub RichNativeOpen(state As RichState)
+    Dim frame As RichRect = { X: 0.0, Y: 0.0, Width: 320.0, Height: 240.0 }
+    state.Root = MInitFrame(MAlloc(MClass("NSScrollView")), frame)
+    state.Entry = MInitFrame(MAlloc(RichMacClass()), frame)
+    If state.Root = Nil Or state.Entry = Nil Then Throw New Exception("Could not create AppKit rich-text editor")
+    MRich(state.Entry, True)
+    MBackground(state.Entry, MWhite(MClass("NSColor")))
+    MCaretColor(state.Entry, MBlack(MClass("NSColor")))
+    MAllowsUndo(state.Entry, False)
+    MVerticalResize(state.Entry, True)
+    MHorizontalResize(state.Entry, False)
+    Dim maxSize As RichSize = { Width: 10000000.0, Height: 10000000.0 }
+    MMaxSize(state.Entry, maxSize)
+    MTracksWidth(MTextContainer(state.Entry), True)
+    MAutoresizing(state.Entry, 2)
+    MDelegate(state.Entry, state.Entry)
+    MDocumentView(state.Root, state.Entry)
+    MVerticalScroll(state.Root, True)
+    MHorizontalScroll(state.Root, False)
+    MAutoresizing(state.Root, 18)
+    MAddSubview(state.Host, state.Root)
+    state.Buffer = MStorage(state.Entry)
+End Sub
+Private Sub RichNativeDispose(state As RichState)
+    If state.Entry <> Nil Then MDelegate(state.Entry, Nil)
+    If state.Root <> Nil Then
+        MDocumentView(state.Root, Nil)
+        MRemove(state.Root)
+    End If
+    If state.Entry <> Nil Then MRelease(state.Entry)
+    If state.Root <> Nil Then MRelease(state.Root)
+    state.Entry = Nil
+    state.Root = Nil
+    state.Buffer = Nil
+End Sub
+Private Sub RichNativeSize(state As RichState, width As Integer, height As Integer)
+    Dim frame As RichRect = { X: 0.0, Y: 0.0, Width: Math.Max(1, width), Height: Math.Max(1, height) }
+    MFrame(state.Root, frame)
+End Sub
+Private Sub RichNativeFocus(state As RichState)
+    MResponder(MWindow(state.Entry), state.Entry)
+End Sub
+Private Sub RichNativeEditable(state As RichState, enabled As Boolean)
+    MEditable(state.Entry, enabled)
+End Sub
+Private Function RichNativeRead(state As RichState) As String
+    Dim content As Ptr = MText(state.Entry)
+    If MTextLength(content) > 200000 Then Throw New InvalidArgumentException("Native text exceeds editor limit")
+    Return MUTF8(content)
+End Function
+Private Sub RichNativeWrite(state As RichState, content As String)
+    Dim native As CFStringRef = CType(content, CFStringRef)
+    Try
+        MSetText(state.Entry, native)
+    Finally
+        MRelease(native)
+    End Try
+End Sub
+Private Function RichNativeSelection(state As RichState, content As String) As RichSelection
+    Dim range As RichRange = MSelection(state.Entry)
+    Dim offsets As Array Of Integer = RichOffsets(content)
+    Dim selection As New RichSelection()
+    selection.Start = RichScalarAt(offsets, range.Location)
+    selection.Length = RichScalarAt(offsets, range.Location + range.Length) - selection.Start
+    Return selection
+End Function
+Private Sub RichNativeSelect(state As RichState, content As String, start As Integer, length As Integer)
+    Dim offsets As Array Of Integer = RichOffsets(content)
+    Dim range As RichRange = { Location: offsets(start), Length: offsets(start + length) - offsets(start) }
+    MSelect(state.Entry, range)
+End Sub
+Private Sub RichMacAttribute(dict As Ptr, key As String, value As Ptr)
+    Dim nativeKey As CFStringRef = CType(key, CFStringRef)
+    Try
+        MSetAttribute(dict, value, nativeKey)
+    Finally
+        MRelease(nativeKey)
+    End Try
+End Sub
+Private Function RichMacAttributes(style As TextStyle) As Ptr
+    Dim size As Double = style.FontSize
+    If size = 0.0 Then size = 12.0
+    Dim font As Ptr = Nil
+    If style.FontName <> "" Then
+        Dim name As CFStringRef = CType(style.FontName, CFStringRef)
+        font = MFontNamed(MClass("NSFont"), name, size)
+        MRelease(name)
+    End If
+    If font = Nil Then font = MSystemFont(MClass("NSFont"), size)
+    Dim manager As Ptr = MFontManager(MClass("NSFontManager"))
+    If style.Bold Then
+        font = MFontTrait(manager, font, 2)
+    Else
+        font = MFontNoTrait(manager, font, 2)
+    End If
+    If style.Italic Then
+        font = MFontTrait(manager, font, 1)
+    Else
+        font = MFontNoTrait(manager, font, 1)
+    End If
+    Dim attributes As Ptr = MNew(MClass("NSMutableDictionary"))
+    RichMacAttribute(attributes, "NSFont", font)
+    RichMacAttribute(attributes, "NSColor", MColor(MClass("NSColor"), style.Red / 65535.0, style.Green / 65535.0, style.Blue / 65535.0, 1.0))
+    Dim underline As Integer = 0
+    If style.Underline Then underline = 1
+    RichMacAttribute(attributes, "NSUnderline", MInteger(MClass("NSNumber"), underline))
+    Return attributes
+End Function
+Private Sub RichNativeTyping(state As RichState, style As TextStyle)
+    Dim pool As Ptr = MNew(MClass("NSAutoreleasePool"))
+    Dim attributes As Ptr = RichMacAttributes(style)
+    Try
+        MTyping(state.Entry, attributes)
+    Finally
+        MRelease(attributes)
+        MDrain(pool)
+    End Try
+End Sub
+Private Sub RichNativeRender(state As RichState, document As StyledText)
+    Dim pool As Ptr = MNew(MClass("NSAutoreleasePool"))
+    Dim offsets As Array Of Integer = RichOffsets(document.PlainText())
+    MBegin(state.Buffer)
+    Try
+        For Each run As StyleRun In document.Runs()
+            Dim attributes As Ptr = RichMacAttributes(run.Style)
+            Try
+                Dim range As RichRange = { Location: offsets(run.Start), Length: offsets(run.Start + run.Length) - offsets(run.Start) }
+                MAttributes(state.Buffer, attributes, range)
+            Finally
+                MRelease(attributes)
+            End Try
+        Next
+    Finally
+        MEnd(state.Buffer)
+        MDrain(pool)
+    End Try
+End Sub
+Private Sub RichMacChanged(receiver As Ptr, actionSelector As Ptr, sender As Ptr)
+    Dim owner As StyledTextEditor = RichMacOwner(receiver)
+    If owner <> Nil Then owner.NativeChanged(receiver)
+End Sub
+Private Sub RichMacSelection(receiver As Ptr, actionSelector As Ptr, sender As Ptr)
+    Dim owner As StyledTextEditor = RichMacOwner(receiver)
+    If owner <> Nil Then owner.NativeSelectionChanged(receiver)
+End Sub
+Private Function RichMacEditing(receiver As Ptr, actionSelector As Ptr, view As Ptr, range As RichRange, replacement As Ptr) As UInt8
+    Dim owner As StyledTextEditor = RichMacOwner(receiver)
+    If owner Is Nil Then Return 1
+    Try
+        If replacement = Nil Then Return 1
+        If range.Length = 0 And MTextLength(replacement) = 0 Then Return 1
+        Dim offsets As Array Of Integer = RichOffsets(owner.Document().PlainText())
+        Dim start As Integer = RichScalarAt(offsets, range.Location)
+        Dim finish As Integer = RichScalarAt(offsets, range.Location + range.Length)
+        If MTextLength(replacement) > 200000 Then Return 0
+        Dim content As String = MUTF8(replacement)
+        If content.AsUTF16LE().Count \ 2 <> MTextLength(replacement) Then Return 0
+        If String.Contains(content, "\r") Then
+            content = String.Replace(String.Replace(content, "\r\n", "\n"), "\r", "\n")
+            owner.NativeNormalizedEdit(start, finish - start, content)
+            Return 0
+        End If
+        If Not owner.NativeAcceptEdit(start, finish - start, content) Then Return 0
+        owner.NativeWillEdit(start, finish - start)
+        Return 1
+    Catch e As Exception
+        owner.LastNativeError = e.Message
+        Return 0
+    End Try
+End Function
+Private Sub RichMacKey(receiver As Ptr, actionSelector As Ptr, nativeEvent As Ptr)
+    Dim owner As StyledTextEditor = RichMacOwner(receiver)
+    If owner <> Nil Then
+        Try
+            Dim modifiers As Integer = MModifiers(nativeEvent)
+            If (modifiers And 1048576) <> 0 And (modifiers And 524288) = 0 Then
+                Dim key As String = MUTF8(MKey(nativeEvent))
+                If String.Len(key) = 1 Then
+                    If owner.NativeShortcut(String.Asc(key), (modifiers And 131072) <> 0) Then Return
+                End If
+            End If
+        Catch e As Exception
+            owner.LastNativeError = e.Message
+        End Try
+    End If
+    Dim parent As RichSuper = { Receiver: receiver, Parent: MClass("NSTextView") }
+    MSuperKey(parent, actionSelector, nativeEvent)
+    If owner <> Nil Then owner.NativeEditFinished()
+End Sub
+#End If
+
+#If TargetWindows Then
+Sequential Structure RichWinRange
+    Start As Int32
+    Finish As Int32
+End Structure
+Sequential Structure RichWinHeader
+    Window As Ptr
+    ID As UInt64
+    Code As UInt32
+End Structure
+Private Class RichWindowsLibrary
+    Public Shared Property ModuleHandle As Ptr = Nil
+End Class
+Private Delegate Function RichWindowsCallback(widget As Ptr, message As UInt32, word As UInt64, param As Integer, id As Integer, data As UInt64) As Int64
+Private Optional Declare Function WLoad Lib "kernel32" Alias "LoadLibraryW" (name As Ptr) As Ptr
+Private Optional Declare Function WCreate Lib "user32" Alias "CreateWindowExW" (extended As UInt32, cls As Ptr, title As Ptr, style As UInt32, x As Int32, y As Int32, width As Int32, height As Int32, parent As Ptr, menu As Ptr, instance As Ptr, creation As Ptr) As Ptr
+Private Optional Declare Function WSubclass Lib "comctl32" Alias "SetWindowSubclass" (widget As Ptr, callback As RichWindowsCallback, id As Integer, data As UInt64) As Int32
+Private Optional Declare Function WUnsubclass Lib "comctl32" Alias "RemoveWindowSubclass" (widget As Ptr, callback As RichWindowsCallback, id As Integer) As Int32
+Private Optional Declare Function WDefault Lib "comctl32" Alias "DefSubclassProc" (widget As Ptr, message As UInt32, word As UInt64, param As Integer) As Int64
+Private Optional Declare Function WSend Lib "user32" Alias "SendMessageW" (widget As Ptr, message As UInt32, word As UInt64, param As Integer) As Int64
+Private Optional Declare Function WSetText Lib "user32" Alias "SetWindowTextW" (widget As Ptr, content As Ptr) As Int32
+Private Optional Declare Function WDestroy Lib "user32" Alias "DestroyWindow" (widget As Ptr) As Int32
+Private Optional Declare Function WIsWindow Lib "user32" Alias "IsWindow" (widget As Ptr) As Int32
+Private Optional Declare Function WMove Lib "user32" Alias "MoveWindow" (widget As Ptr, x As Int32, y As Int32, width As Int32, height As Int32, repaint As Int32) As Int32
+Private Optional Declare Function WDPI Lib "user32" Alias "GetDpiForWindow" (widget As Ptr) As UInt32
+Private Optional Declare Function WFocus Lib "user32" Alias "SetFocus" (widget As Ptr) As Ptr
+Private Optional Declare Function WKeyState Lib "user32" Alias "GetKeyState" (key As Int32) As Int16
+Private Optional Declare Sub WHeader Lib "msvcrt" Alias "memcpy" (ByRef header As RichWinHeader, source As Ptr, count As UInt64)
+
+Private Function RichWide(content As String) As Bytes
+    Dim data As Bytes = content.AsUTF16LE()
+    data.Append(0)
+    data.Append(0)
+    Return data
+End Function
+Private Sub RichLittle(data As Bytes, offset As Integer, value As Integer)
+    For i As Integer = 0 To 3
+        data.SetItem(offset + i, value Mod 256)
+        value = value \ 256
+    Next
+End Sub
+Private Function RichWinBuffer(count As Integer) As Bytes
+    Dim data As New Bytes()
+    For i As Integer = 1 To count
+        data.Append(0)
+    Next
+    Return data
+End Function
+Private Function RichReadLittle(data As Bytes, offset As Integer) As Integer
+    Return data.Item(offset) + data.Item(offset + 1) * 256 + data.Item(offset + 2) * 65536 + data.Item(offset + 3) * 16777216
+End Function
+Private Function RichWinReadRange(entry As Ptr) As RichWinRange
+    Dim data As Bytes = RichWinBuffer(8)
+    WSend(entry, 1076, 0, CType(data.DataPtr(), Integer))
+    Dim range As RichWinRange = { Start: RichReadLittle(data, 0), Finish: RichReadLittle(data, 4) }
+    Return range
+End Function
+Private Sub RichWinSetRange(entry As Ptr, first As Integer, last As Integer)
+    Dim data As Bytes = RichWinBuffer(8)
+    RichLittle(data, 0, first)
+    RichLittle(data, 4, last)
+    WSend(entry, 1079, 0, CType(data.DataPtr(), Integer))
+End Sub
+Private Function RichWinFormat(style As TextStyle) As Bytes
+    Dim data As New Bytes()
+    For i As Integer = 0 To 115
+        data.Append(0)
+    Next
+    RichLittle(data, 0, 116)
+    RichLittle(data, 4, 4294967295)
+    Dim effects As Integer = 0
+    If style.Bold Then effects += 1
+    If style.Italic Then effects += 2
+    If style.Underline Then effects += 4
+    RichLittle(data, 8, effects)
+    Dim weight As Integer = 400
+    If style.Bold Then weight = 700
+    data.SetItem(90, weight Mod 256)
+    data.SetItem(91, weight \ 256)
+    RichLittle(data, 96, 16777215)
+    If style.Underline Then data.SetItem(112, 1)
+    Dim size As Double = style.FontSize
+    If size = 0.0 Then size = 12.0
+    Dim twips As Integer = size * 20.0 + 0.5
+    RichLittle(data, 12, twips)
+    RichLittle(data, 20, (style.Red \ 257) + (style.Green \ 257) * 256 + (style.Blue \ 257) * 65536)
+    data.SetItem(24, 1)
+    Dim family As String = style.FontName
+    If family = "" Then family = "Segoe UI"
+    Dim name As Bytes = family.AsUTF16LE()
+    For i As Integer = 0 To name.Count - 1
+        data.SetItem(26 + i, name.Item(i))
+    Next
+    Return data
+End Function
+Private Delegate Sub RichWindowsTimer(widget As Ptr, message As UInt32, id As UInt64, ticks As UInt32)
+Private Optional Declare Function WCleanupTimer Lib "user32" Alias "SetTimer" (widget As Ptr, id As UInt64, interval As UInt32, callback As RichWindowsTimer) As UInt64
+Private Optional Declare Function WKillTimer Lib "user32" Alias "KillTimer" (widget As Ptr, id As UInt64) As Int32
+Private Sub RichNativeScheduleCleanup()
+    If WCleanupTimer(Nil, 0, 1, AddressOf RichWindowsDrain) = 0 Then Throw New Exception("Could not schedule Windows editor cleanup")
+End Sub
+Private Sub RichWindowsDrain(widget As Ptr, message As UInt32, id As UInt64, ticks As UInt32)
+    WKillTimer(Nil, id)
+    RichDrainClosed()
+End Sub
+
+Private Sub RichNativeOpen(state As RichState)
+    If WIsWindow(state.Host) = 0 Then Throw New InvalidArgumentException("Attach editor to a live window before Open")
+    If RichWindowsLibrary.ModuleHandle = Nil Then
+        Dim dll As Bytes = RichWide("Msftedit.dll")
+        RichWindowsLibrary.ModuleHandle = WLoad(dll.DataPtr())
+    End If
+    If RichWindowsLibrary.ModuleHandle = Nil Then Throw New UnsupportedOperationException("Windows Rich Edit is unavailable")
+    Dim cls As Bytes = RichWide("RICHEDIT50W")
+    state.Entry = WCreate(512, cls.DataPtr(), Nil, 1344344132, 0, 0, 1, 1, state.Host, Nil, Nil, Nil)
+    If state.Entry = Nil Then Throw New Exception("Could not create Windows Rich Edit")
+    state.Root = state.Entry
+    state.Buffer = state.Entry
+    If WSubclass(state.Host, AddressOf RichWindowsHost, state.ID + 1, 0) = 0 Then Throw New Exception("Could not subclass rich-text host")
+    If WSubclass(state.Entry, AddressOf RichWindowsEntry, state.ID + 1, 0) = 0 Then Throw New Exception("Could not subclass Rich Edit")
+    WSend(state.Entry, 1093, 0, 524289)
+    WSend(state.Entry, 1106, 0, 0)
+    WSend(state.Entry, 1077, 0, 200000)
+    WSend(state.Entry, 1115, 0, 0)
+    WSend(state.Entry, 1091, 0, 16777215)
+End Sub
+Private Sub RichNativeDispose(state As RichState)
+    If state.Host <> Nil Then
+        If WIsWindow(state.Host) <> 0 Then WUnsubclass(state.Host, AddressOf RichWindowsHost, state.ID + 1)
+    End If
+    If state.Entry <> Nil Then
+        If WIsWindow(state.Entry) <> 0 Then
+            WUnsubclass(state.Entry, AddressOf RichWindowsEntry, state.ID + 1)
+            WDestroy(state.Entry)
+        End If
+    End If
+    state.Root = Nil
+    state.Entry = Nil
+    state.Buffer = Nil
+End Sub
+Private Sub RichNativeSize(state As RichState, width As Integer, height As Integer)
+    Dim dpi As Integer = 96
+    Try
+        dpi = WDPI(state.Host)
+    Catch e As LibraryUnavailableException
+        dpi = 96
+    End Try
+    If dpi <= 0 Then dpi = 96
+    Dim scale As Double = dpi / 96.0
+    WMove(state.Entry, 0, 0, Math.Max(1, width * scale), Math.Max(1, height * scale), 1)
+End Sub
+Private Sub RichNativeFocus(state As RichState)
+    WFocus(state.Entry)
+End Sub
+Private Sub RichNativeEditable(state As RichState, enabled As Boolean)
+    Dim readOnlyValue As UInt64 = 1
+    If enabled Then readOnlyValue = 0
+    WSend(state.Entry, 207, readOnlyValue, 0)
+End Sub
+Private Function RichNativeRead(state As RichState) As String
+    Dim lengthRequest As Bytes = RichWinBuffer(8)
+    RichLittle(lengthRequest, 0, 10)
+    RichLittle(lengthRequest, 4, 1200)
+    Dim length As Integer = WSend(state.Entry, 1119, CType(lengthRequest.DataPtr(), Integer), 0)
+    If length < 0 Or length > 200000 Then Throw New InvalidArgumentException("Native text exceeds editor limit")
+    Dim data As New Bytes()
+    For i As Integer = 0 To (length + 1) * 2 - 1
+        data.Append(0)
+    Next
+    Dim request As Bytes = RichWinBuffer(32)
+    RichLittle(request, 0, data.Count)
+    RichLittle(request, 8, 1200)
+    Dim copied As Integer = WSend(state.Entry, 1118, CType(request.DataPtr(), Integer), CType(data.DataPtr(), Integer))
+    If copied < 0 Or copied > length Then Throw New Exception("Could not read Rich Edit content")
+    Dim content As New Bytes()
+    content.Append(data.DataPtr(), copied * 2)
+    Return String.Replace(content.ToString(Text.Encodings.UTF16LE), "\r", "\n")
+End Function
+Private Sub RichNativeWrite(state As RichState, content As String)
+    Dim data As Bytes = RichWide(content)
+    If WSetText(state.Entry, data.DataPtr()) = 0 Then Throw New Exception("Could not replace Rich Edit content")
+End Sub
+Private Function RichNativeSelection(state As RichState, content As String) As RichSelection
+    Dim range As RichWinRange = RichWinReadRange(state.Entry)
+    Dim offsets As Array Of Integer = RichOffsets(content)
+    Dim selection As New RichSelection()
+    selection.Start = RichScalarAt(offsets, range.Start)
+    selection.Length = RichScalarAt(offsets, range.Finish) - selection.Start
+    Return selection
+End Function
+Private Sub RichNativeSelect(state As RichState, content As String, start As Integer, length As Integer)
+    Dim offsets As Array Of Integer = RichOffsets(content)
+    RichWinSetRange(state.Entry, offsets(start), offsets(start + length))
+End Sub
+Private Sub RichNativeTyping(state As RichState, style As TextStyle)
+    Dim selection As RichWinRange = RichWinReadRange(state.Entry)
+    If selection.Start <> selection.Finish Then Return
+    Dim data As Bytes = RichWinFormat(style)
+    If WSend(state.Entry, 1092, 1, CType(data.DataPtr(), Integer)) = 0 Then Throw New Exception("Could not set Rich Edit typing format")
+End Sub
+Private Sub RichNativeRender(state As RichState, document As StyledText)
+    Dim offsets As Array Of Integer = RichOffsets(document.PlainText())
+    RichWinSetRange(state.Entry, 0, offsets(document.Length()))
+    Dim paragraph As Bytes = RichWinBuffer(188)
+    RichLittle(paragraph, 0, 188)
+    RichLittle(paragraph, 4, 511)
+    paragraph.SetItem(24, 1)
+    If WSend(state.Entry, 1095, 0, CType(paragraph.DataPtr(), Integer)) = 0 Then Throw New Exception("Could not reset Rich Edit paragraph format")
+    For Each run As StyleRun In document.Runs()
+        RichWinSetRange(state.Entry, offsets(run.Start), offsets(run.Start + run.Length))
+        Dim data As Bytes = RichWinFormat(run.Style)
+        If WSend(state.Entry, 1092, 1, CType(data.DataPtr(), Integer)) = 0 Then Throw New Exception("Could not style Rich Edit selection")
+    Next
+End Sub
+Private Function RichWindowsState(id As Integer) As RichState
+    Dim index As Integer = id - 1
+    If index < 0 Or index >= Array.Count(RichRegistry.Items) Then Return Nil
+    Return RichRegistry.Items(index).State
+End Function
+Private Function RichWindowsHost(widget As Ptr, message As UInt32, word As UInt64, param As Integer, id As Integer, data As UInt64) As Int64
+    Dim owner As StyledTextEditor = RichGetOwner(CType(id, Ptr))
+    Dim state As RichState = RichWindowsState(id)
+    If message = 130 Then
+        WUnsubclass(widget, AddressOf RichWindowsHost, id)
+        If owner <> Nil Then owner.NativeDestroyed(widget)
+        If state <> Nil Then
+            state.Host = Nil
+            state.Root = Nil
+            state.Entry = Nil
+            state.Buffer = Nil
+        End If
+    ElseIf owner <> Nil Then
+        If message = 273 And CType(param, Ptr) = owner.TextHandle And (word >> 16) = 768 Then
+            If state <> Nil And state.MessageDepth > 0 Then
+                state.TextPending = True
+            Else
+                owner.NativeChanged(owner.TextHandle)
+            End If
+        End If
+        If message = 78 And param <> 0 Then
+            Dim header As RichWinHeader
+            WHeader(header, CType(param, Ptr), 24)
+            If header.Window = owner.TextHandle And header.Code = 1794 Then
+                If state <> Nil And state.MessageDepth > 0 Then
+                    state.SelectionPending = True
+                Else
+                    owner.NativeSelectionChanged(owner.TextHandle)
+                End If
+            End If
+        End If
+    End If
+    Return WDefault(widget, message, word, param)
+End Function
+Private Function RichWindowsEntry(widget As Ptr, message As UInt32, word As UInt64, param As Integer, id As Integer, data As UInt64) As Int64
+    Dim owner As StyledTextEditor = RichGetOwner(CType(id, Ptr))
+    Dim state As RichState = RichWindowsState(id)
+    If message = 130 Then
+        WUnsubclass(widget, AddressOf RichWindowsEntry, id)
+        If owner <> Nil Then owner.NativeDestroyed(widget)
+        If state <> Nil Then
+            If state.Entry = widget Then state.Entry = Nil
+            If state.Root = widget Then state.Root = Nil
+            If state.Buffer = widget Then state.Buffer = Nil
+        End If
+        Return WDefault(widget, message, word, param)
+    End If
+    If owner <> Nil Then
+        If message = 258 And state <> Nil Then
+            If word >= 55296 And word <= 56319 Then
+                If Not owner.IsReadOnly Then state.PendingHigh = word
+                Return 0
+            ElseIf word >= 56320 And word <= 57343 Then
+                If state.PendingHigh = 0 Or owner.IsReadOnly Then Return 0
+                Dim pair As Bytes = RichWinBuffer(6)
+                pair.SetItem(0, state.PendingHigh Mod 256)
+                pair.SetItem(1, state.PendingHigh \ 256)
+                pair.SetItem(2, word Mod 256)
+                pair.SetItem(3, word \ 256)
+                state.PendingHigh = 0
+                WSend(widget, 194, 1, CType(pair.DataPtr(), Integer))
+                Return 0
+            Else
+                state.PendingHigh = 0
+            End If
+        End If
+        Dim control As Boolean = WKeyState(17) < 0
+        If message = 256 And control And WKeyState(18) >= 0 Then
+            If owner.NativeShortcut(word, WKeyState(16) < 0) Then Return 0
+            If word = 86 Then
+                WSend(widget, 770, 0, 0)
+                Return 0
+            End If
+            ' Keep navigation, selection and clipboard; suppress native-only format commands.
+            Select Case word
+                Case 8, 33, 34, 35, 36, 37, 38, 39, 40, 45, 46
+                Case 65, 67, 88
+                    If WKeyState(16) < 0 Then Return 0
+                Case 16, 17
+                Case Else
+                    Return 0
+            End Select
+        End If
+        If message = 256 And word = 45 And WKeyState(16) < 0 Then
+            WSend(widget, 770, 0, 0)
+            Return 0
+        End If
+        If message = 258 And control And word <> 1 And word <> 3 And word <> 24 And word <> 8 And word <> 13 And word <> 127 Then Return 0
+        If message = 256 And word = 46 Then owner.NativeWillReplaceSelection(False, True)
+        If message = 258 Then owner.NativeWillReplaceSelection(word = 8, False)
+        If message = 768 Or message = 770 Or message = 771 Or message = 194 Or message = 1088 Then owner.NativeWillReplaceSelection(False, False)
+        If message = 770 Then
+            Dim returned As Int64 = WSend(widget, 1088, 13, 0)
+            If state Is Nil Or state.MessageDepth = 0 Then
+                owner.NativeEditFinished()
+                owner.NativeSelectionChanged(widget)
+            End If
+            Return returned
+        End If
+    End If
+    If state <> Nil Then state.MessageDepth += 1
+    Dim returned As Int64 = WDefault(widget, message, word, param)
+    If state <> Nil Then state.MessageDepth -= 1
+    ' Rich Edit notifies before its input operation finishes. Reconcile only
+    ' after the outer WndProc returns; nested selection reads must not flush
+    ' notifications against the old document or replace its typing attributes.
+    If owner <> Nil And state <> Nil And state.MessageDepth = 0 And Not state.DrainingMessages Then
+        state.DrainingMessages = True
+        Try
+            If state.TextPending Then
+                state.TextPending = False
+                owner.NativeChanged(widget)
+            End If
+            If state.SelectionPending Then
+                state.SelectionPending = False
+                owner.NativeSelectionChanged(widget)
+            End If
+        Finally
+            state.DrainingMessages = False
+        End Try
+    End If
+    If owner <> Nil Then
+        If (state Is Nil Or state.MessageDepth = 0) And (message = 256 Or message = 257 Or message = 258 Or message = 514 Or message = 515 Or message = 768 Or message = 771 Or message = 194 Or message = 1088) Then
+            owner.NativeEditFinished()
+            owner.NativeSelectionChanged(widget)
+        End If
+    End If
+    Return returned
+End Function
+#End If

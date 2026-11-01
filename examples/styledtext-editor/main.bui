@@ -1,0 +1,164 @@
+Import styledtext
+Import styledtextui
+
+Private Class EditorAction Inherits Button
+    Public Property Owner As Weak EditorWindow
+    Public Property Kind As Integer = 0
+    Handle Action()
+        Dim window As EditorWindow = Owner
+        If window Is Nil Then Return
+        Try
+            Select Case Kind
+                Case 1
+                    window.Editor.SetSelectionBold(Not window.Editor.TypingStyle().Bold)
+                Case 2
+                    window.Editor.SetSelectionItalic(Not window.Editor.TypingStyle().Italic)
+                Case 3
+                    window.Editor.SetSelectionUnderline(Not window.Editor.TypingStyle().Underline)
+                Case 4
+                    window.Editor.Undo()
+                Case 5
+                    window.Editor.Redo()
+                Case 6
+                    window.SaveDocument()
+                Case 7
+                    window.LoadDocument()
+            End Select
+            window.Editor.FocusEditor()
+            window.Status.Text = "Selection: " + String.From(window.Editor.SelectionStart) + " + " + String.From(window.Editor.SelectionLength)
+        Catch e As Exception
+            window.Status.Text = e.Message
+        End Try
+    End Handle
+End Class
+Private Class DemoEditor Inherits StyledTextEditor
+    Public Property Status As Label
+    Handle DocumentChanged()
+        If Status <> Nil Then Status.Text = String.From(CharacterCount) + " characters · Ctrl/Cmd B, I, U · undo/redo"
+    End Handle
+End Class
+Class EditorWindow Inherits Window
+    Public Property Editor As DemoEditor
+    Public Property Status As Label
+    Public Sub Constructor(keyboardTest As Boolean)
+        Super.Constructor()
+        Title = "Buoy StyledText Editor"
+        Move(100, 100, 800, 540)
+        Status = New Label()
+        Status.Move(16, 492, 760, 28)
+        Status.Text = "Select text to format it, or format the caret and start typing."
+        AddSubview(Status)
+        Dim labels As Array Of String = ["Bold", "Italic", "Underline", "Undo", "Redo", "Save…", "Open…"]
+        For i As Integer = 0 To Array.Count(labels) - 1
+            Dim button As New EditorAction()
+            button.Owner = Me
+            button.Kind = i + 1
+            button.Caption = labels(i)
+            button.Move(16 + i * 106, 12, 100, 32)
+            AddSubview(button)
+        Next
+        Editor = New DemoEditor()
+        Editor.Status = Status
+        Editor.Move(16, 56, 768, 424)
+        AddSubview(Editor)
+        Dim body As New TextStyle()
+        body.FontSize = 14.0
+        Dim document As New StyledText("Native rich text, in Buoy.\n\nSelect a word and try Bold, Italic or Underline.\n\nUnicode stays intact: café · 世界 · 😀\n\nSave and reopen this document with its formatting.", body)
+        Dim titleStyle As TextStyle = body.Copy()
+        titleStyle.FontSize = 24.0
+        titleStyle.Bold = True
+        titleStyle.Blue = 45000
+        document.SetStyle(0, String.Len("Native rich text, in Buoy."), titleStyle)
+        Dim accent As TextStyle = body.Copy()
+        accent.Italic = True
+        accent.Red = 45000
+        document.SetStyle(String.IndexOf(document.PlainText(), "café"), String.Len("café · 世界 · 😀"), accent)
+        If keyboardTest Then document = New StyledText("", body)
+        Editor.SetDocument(document)
+    End Sub
+    Public Sub SaveDocument()
+        Dim bytes As Bytes = EncodeStyledText(Editor.Document())
+        Dim dialog As New SaveFileDialog()
+        dialog.Title = "Save styled document"
+        dialog.SuggestedFileName = "Document.bstx"
+        dialog.AddFilter("Styled text", "*.bstx")
+        If Not dialog.Show(Me) Then Return
+        Dim opened As Result Of BinaryStream, IOError = BinaryStream.Create(dialog.SelectedItem)
+        If opened.IsErr Then Throw New Exception("Could not create document")
+        Dim stream As BinaryStream = opened.Value
+        Try
+            stream.Write(bytes)
+            stream.Flush()
+            If stream.LastError.HasValue Then Throw New Exception("Could not write document")
+        Finally
+            stream.Close()
+        End Try
+    End Sub
+    Public Sub LoadDocument()
+        Dim dialog As New OpenFileDialog()
+        dialog.Title = "Open styled document"
+        dialog.AddFilter("Styled text", "*.bstx")
+        If Not dialog.Show(Me) Then Return
+        Dim opened As Result Of BinaryStream, IOError = BinaryStream.Open(dialog.SelectedItem, False)
+        If opened.IsErr Then Throw New Exception("Could not open document")
+        Dim stream As BinaryStream = opened.Value
+        Dim document As StyledText
+        Try
+            If stream.Length > 16000000 Then Throw New InvalidArgumentException("Document exceeds 16 MB")
+            Dim bytes As Bytes = stream.Read(stream.Length)
+            If stream.LastError.HasValue Then Throw New Exception("Could not read document")
+            document = DecodeStyledText(bytes)
+        Finally
+            stream.Close()
+        End Try
+        Editor.SetDocument(document)
+    End Sub
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        If Editor Is Nil Then Return
+        Editor.Move(16, 56, Math.Max(100, Width - 32), Math.Max(100, Height - 116))
+        Editor.RefreshNative()
+        Status.Move(16, Height - 48, Math.Max(100, Width - 32), 28)
+    End Handle
+    Handle Closing() As Boolean
+        If Editor <> Nil Then Editor.Close()
+        Return False
+    End Handle
+    Handle Closed()
+        Application.Quit()
+    End Handle
+End Class
+Private Class KeyboardProbe Inherits Timer
+    Public Property Owner As EditorWindow
+    Public Property Ticks As Integer = 0
+    Public Overrides Sub NotifyTick()
+        Ticks += 1
+        Dim document As StyledText = Owner.Editor.Document()
+        If document.PlainText() = "Hello world!" Then
+            For i As Integer = 0 To document.Length() - 1
+                If document.StyleAt(i).Bold <> (i < 5) Then Throw New Exception("Keyboard typing style mismatch at " + String.From(i))
+            Next
+            If Owner.Editor.LastNativeError <> "" Then Throw New Exception(Owner.Editor.LastNativeError)
+            Print "Real keyboard typing, bold shortcut and undo/redo passed"
+            Stop()
+            Owner.Editor.Close()
+            Application.Quit()
+        ElseIf Ticks > 200 Then
+            Throw New Exception("Keyboard test timed out: " + document.PlainText() + "; " + Owner.Editor.LastNativeError)
+        End If
+    End Sub
+End Class
+Sub Main(args As Array Of String)
+    Dim keyboardTest As Boolean = Array.Contains(args, "--keyboard-test")
+    Dim window As New EditorWindow(keyboardTest)
+    window.Show()
+    window.Editor.Open()
+    window.Editor.FocusEditor()
+    Dim probe As KeyboardProbe
+    If keyboardTest Then
+        probe = New KeyboardProbe()
+        probe.Owner = window
+        probe.Period = 100
+        probe.Start()
+    End If
+    Application.Run()
+End Sub
