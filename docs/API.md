@@ -6,7 +6,7 @@ The editor supports mixed fonts and sizes, bold, italic, underline, foreground c
 
 ## Run the editor
 
-Run `python3 tools/build_styledtextui.py` to seal both packages and build the demo. Alternatively, install both `styledtext` and `styledtextui` sealed packages in the project's packages directory, then build [the example](../examples/styledtext-editor/main.bui):
+Install both `styledtext` and `styledtextui` sealed packages in the project's packages directory, then build [the example](../examples/styledtext-editor/main.bui):
 
 ```
 buoy examples/styledtext-editor/main.bui -o dist/styledtext-editor
@@ -15,7 +15,8 @@ buoy examples/styledtext-editor/main.bui -o dist/styledtext-editor
 
 The demo has Bold, Italic, Underline, Undo, Redo, Save and Open buttons. Save/Open use native file pickers and the formatting-preserving BSTX format. They do not import RTF. Ctrl+B/I/U and Ctrl+Z/Y (Ctrl+Shift+Z also works) are handled by the editor; macOS uses Command in place of Control. The native control supplies text input, mouse selection, wrapping, scrolling and ordinary text copy/paste. Windows paste explicitly requests Unicode plain text; the package does not promise rich clipboard interchange.
 
-On this Debian development host the installed Buoy GUI runtime additionally needs JPEG 8. Use the existing compatibility directory with `LD_LIBRARY_PATH=/tmp/buoy-chatui-jpeg8/build` if the loader reports missing `libjpeg.so.8`, or run in the project's Ubuntu GUI environment. This is an installed runtime dependency, not a text-editor dependency.
+The installed Buoy GUI runtime may require `libjpeg.so.8`. Supply the matching
+JPEG8 ABI or use a toolchain environment that provides it.
 
 ## Embed it
 
@@ -33,14 +34,7 @@ UI documents allow 100,000 scalars, 4096 normalized runs, and font family names 
 
 The editor's history is bounded to 100 snapshots and 8 MB across both undo and redo. Oldest entries are discarded when either limit is reached. Native CRLF and CR input is normalized to LF; programmatic document input requires LF. Contiguous native typing and same-direction deletion coalesce until whitespace, a caret move, style change or explicit command. Every edit validates/copies the portable document and reapplies native style runs; this is intended for small and medium documents, not a large-document rope editor. All text/format commands preflight their candidate state. Native input that fails validation is rejected or restored to the previous model. Native event handlers can report their own errors without undoing an already committed edit.
 
-## Verification and platform status
-
-
-The verifier seals both packages into an isolated project and checks the module, test and demo with the real compiler on all six targets, and verifies test/demo LLVM generation on each target. On Linux it executes a real GTK window and independently reads native tag properties, then sends actual X11 keyboard events to the running demo through XTest. Tests cover Unicode and repeated-character edits, mixed formatting, grouped undo, typing attributes, read-only input, snapshots, exception containment, close-in-handler, deferred teardown and reopening. Only the installed Buoy 0.72 View constructor's known obsolete `focus-out` signal diagnostic is tolerated; other native diagnostics fail verification.
-
-`--macos-host` transfers freshly sealed packages and the test into a unique temporary project on an already-configured SSH host, compiler-checks/builds/runs it there, requires both completion markers, and removes the temporary project. `--macos-compiler` selects the installed compiler. `--report` records successful checks, native scope and source/package fingerprints in JSON.
-
-`--windows-lab` additionally cross-compiles and executes native Rich Edit tests in the already-provisioned local Windows VM's separate SSH session. It verifies native bold/twips, Unicode selection/replacement, undo and repeated-character styling, requires a completion marker, and cleans up its unique guest directory. It does not operate the shared console or install/start a VM.
+## Platform status
 
 Native execution is verified on Linux x86_64, Windows x86_64 and macOS ARM64. The remaining architectures are type-checked and LLVM-generated. Linking AppKit on this Linux host also needs a complete Apple SDK, which is not installed. The package is a library control, not a patch to Buoy's built-in TextArea or its Xojo shim.
 
@@ -51,5 +45,3 @@ The document canvas is white with a black caret/default foreground on every back
 Pair editor Open with Close in the host Window’s Closing event, before native views are destroyed. Reopening requires the original host View to remain alive and attached.
 
 Native teardown uses the platform run loop (GLib idle, Win32 timer, AppKit delayed selector), with identities retained until disposal. The standalone build keeps its runtime libraries in dist/styledtext-editor-app, separate from other applications.
-
-Test suites and fixtures are maintainer-local and are not part of this public repository.

@@ -50,7 +50,7 @@ Exact portable colors/sizes remain unchanged by display. GTK uses Pango sizes an
 
 Ctrl+B/I/U, Ctrl+Z/Y and Ctrl+Shift+Z are handled on Linux/Windows. macOS uses Command. Ordinary native text copy/paste remains available; Windows requests Unicode plain text. Rich clipboard styles, RTF import/export, paragraph layout, attachments, bidirectional selection orientation preservation, and native edit-menu integration are outside this version. Save portable documents through the styledtext codec.
 
-Linux x86_64 and Windows x86_64 native execution is verified. All six targets compiler-check; AppKit and remaining architectures still require native execution. Run tests/styledtextui_verify.py on the Linux host; --windows-lab uses the already-provisioned local Windows lab in a separate SSH session. See the package README for JPEG runtime setup and the known upstream View focus-signal diagnostic.
+Linux x86_64 and Windows x86_64 native execution is verified. All six targets compiler-check; AppKit and remaining architectures still require native execution. See the package README for JPEG runtime setup and the known upstream View focus-signal diagnostic.
 
 [Getting started](getting-started.md) · [Typed API](typed-api.md) · [Overview](index.md)
 

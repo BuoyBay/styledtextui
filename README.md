@@ -1,6 +1,6 @@
-# Embed a native rich-text editor over StyledText documents
+# Embed a View-based native rich-text editor over StyledText documents
 
-A **native rich-text editor** for Buoy. `StyledTextEditor Inherits View` embeds a GtkTextView on Linux, an NSTextView on macOS, or a Windows Rich Edit 4.1 (`RICHEDIT50W`) control. It edits portable [StyledText](docs/API.md) documents without flattening their formatting.
+A **View-based native rich-text editor**. `StyledTextEditor Inherits View` embeds a GtkTextView on Linux, an NSTextView on macOS, or a Windows Rich Edit 4.1 (`RICHEDIT50W`) control. It edits portable [StyledText](docs/API.md) documents without flattening their formatting.
 
 The editor supports mixed fonts and sizes, bold, italic, underline, foreground color, scalar-based selection, typing attributes, and formatting-preserving undo/redo. It keeps the exact portable attributes as its source of truth; native display rounding (Windows twips and RGB8, for example) never rewrites saved RGB16 colors or fractional sizes. Available native fonts may substitute missing families.
 
@@ -34,8 +34,6 @@ On your own machine, install Buoy and run:
 ```sh
 buoy ai init --both
 ```
-
-The generated agent files and editor settings stay local and are ignored by Git.
 
 ## Contributing
 
