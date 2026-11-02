@@ -1,4 +1,4 @@
-# Embed a View-based native rich-text editor over StyledText documents
+# View-based native rich-text editor on StyledText
 
 A **View-based native rich-text editor**. `StyledTextEditor Inherits View` embeds a GtkTextView on Linux, an NSTextView on macOS, or a Windows Rich Edit 4.1 (`RICHEDIT50W`) control. It edits portable [StyledText](docs/API.md) documents without flattening their formatting.
 
